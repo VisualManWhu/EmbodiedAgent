@@ -66,7 +66,7 @@ def generate_launch_description():
              parameters=[params_file],
              condition=IfCondition(enable_bridge)),
 
-        Node(package='embodied_mvp', executable='search_node', name='search_node',
+        Node(package='embodied_mvp', executable='agent_node', name='agent_node',
              parameters=[params_file, {'target_class': target_class}],
              condition=IfCondition(enable_search)),
 

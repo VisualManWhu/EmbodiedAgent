@@ -20,9 +20,9 @@ from std_msgs.msg import Bool
 from vision_msgs.msg import Detection2DArray
 
 
-class SearchNode(Node):
+class AgentNode(Node):
     def __init__(self):
-        super().__init__('search_node')
+        super().__init__('agent_node')
 
         self.declare_parameter('target_class', 'chair')
         self.declare_parameter('image_width', 640)
@@ -137,7 +137,7 @@ class SearchNode(Node):
 
         period = 1.0 / float(p('control_rate_hz').value)
         self.create_timer(period, self.tick)
-        self.get_logger().info(f'search_node hunting target_class="{self.target_class}"')
+        self.get_logger().info(f'agent_node hunting target_class="{self.target_class}"')
 
     def on_image_meta(self, msg: Image):
         if msg.width != self.W or msg.height != self.H:
@@ -333,7 +333,7 @@ class SearchNode(Node):
 
 def main():
     rclpy.init()
-    node = SearchNode()
+    node = AgentNode()
     try:
         rclpy.spin(node)
     finally:

@@ -87,7 +87,7 @@ det_bridge_node:
   ros__parameters:
     port: 9090                   # laptop POSTs detections here
 
-search_node:
+agent_node:
   ros__parameters:
     target_class: chair
     image_width: 640

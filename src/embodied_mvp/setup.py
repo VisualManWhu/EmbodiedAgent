@@ -27,7 +27,7 @@ setup(
             'side_ir_node = embodied_mvp.side_ir_node:main',
             'pantilt_node = embodied_mvp.pantilt_node:main',
             'yolo_node = embodied_mvp.yolo_node:main',
-            'search_node = embodied_mvp.search_node:main',
+            'agent_node = embodied_mvp.agent_node:main',
             'mjpeg_node = embodied_mvp.mjpeg_node:main',
             'det_bridge_node = embodied_mvp.det_bridge_node:main',
         ],
