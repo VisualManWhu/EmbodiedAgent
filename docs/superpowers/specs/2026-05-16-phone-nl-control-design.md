@@ -19,6 +19,9 @@ spots a chair → tells the car to find the chair → and so on.
 4. Motion commands move a **fixed small step** per command.
 5. A new command **immediately interrupts** the current task.
 6. On arrival at a target: **notify + auto-send one photo**.
+7. "旋转拍照" command: rotate in place, take 4 photos (~90° apart), end back
+   at roughly the original heading. Return accuracy is **approximate**
+   (open-loop, no encoder/IMU) — acceptable.
 
 ## Architecture
 
@@ -50,9 +53,16 @@ Evolves the current `search_node` into a mode-based behavior supervisor.
 | IDLE   | stand by                                              | publishes 0     |
 | MANUAL | execute one timed fixed-step move, then revert to IDLE| fixed twist until deadline |
 | SEARCH | existing search FSM (SEARCHING/APPROACHING/ARRIVED as internal sub-states) | existing logic |
+| ROTATE_PHOTO | 4× { still dwell + emit `photo_ready:N` } separated by ~90° timed rotations, then IDLE | dwell=0, rotate=fixed wz |
 
 The SEARCH sub-state machine and all approach/scan/arrival logic is the current
 `search_node` behavior, unchanged — it just becomes the SEARCH mode body.
+
+**ROTATE_PHOTO sequence:** for N = 1..4 — hold still for `photo_dwell_sec`
+(sharp frame) while exposing `event = photo_ready:N`, then rotate in place for
+`rotate_90_sec` (timed, open-loop ≈ 90°). After the 4th photo and 4th rotation
+the car has turned ≈ 360°, back to roughly the original heading; mode → IDLE,
+`event = rotate_photo_done`. Return heading is approximate (no odometry).
 
 **HTTP server** (port 9091, `ThreadingHTTPServer`, same pattern as
 `det_bridge_node` / `mjpeg_node`):
@@ -65,15 +75,18 @@ The SEARCH sub-state machine and all approach/scan/arrival logic is the current
   - `{"action":"stop"}` → IDLE.
   - `{"action":"find","target":"<coco_class>"}` → SEARCH with `target_class`
     set at runtime.
+  - `{"action":"rotate_photo"}` → ROTATE_PHOTO.
 - `GET /status` — returns `{"mode": "...", "event": "..."}`. `event` carries
-  one-shot notices, e.g. `arrived:bottle`, consumed/cleared after it is read.
+  one-shot notices, e.g. `arrived:bottle`, `photo_ready:2`, `rotate_photo_done`,
+  consumed/cleared after it is read.
 
 **Watchdog:** in MANUAL, when `now > deadline` → revert to IDLE and publish 0.
 `motor_node`'s existing 0.5 s `/cmd_vel` timeout is the lower-level failsafe.
 
 **Params (params.yaml `agent_node`):** `command_port: 9091`,
-`manual_step_sec: 1.0`, plus all existing search params. `target_class` becomes
-a runtime-settable default rather than a fixed launch arg.
+`manual_step_sec: 1.0`, `rotate_90_sec` (calibrated empirically — duration of a
+~90° in-place turn), `photo_dwell_sec: 2.0`, plus all existing search params.
+`target_class` becomes a runtime-settable default rather than a fixed launch arg.
 
 **Single /cmd_vel owner:** modes are mutually exclusive; a new command overwrites
 `mode`, so the previous task ends cleanly with no arbitration needed.
@@ -88,6 +101,9 @@ New pure-Python file under `laptop/`. Dependency: `python-telegram-bot`.
 2. "photo" → GET Pi `:8080/snapshot` → send the image back via Telegram.
 3. While a `find` is active → background poll Pi `:9091/status` → on
    `event == arrived:<X>` → send "已到达 X" + auto-fetch a snapshot and send it.
+4. While a `rotate_photo` is active → poll Pi `:9091/status` → on each
+   `event == photo_ready:N` → GET snapshot, send to phone labelled photo N of 4
+   (前/右/后/左); on `rotate_photo_done` → send "旋转拍照完成".
 
 **Keyword parse table (Chinese → command):**
 
@@ -99,7 +115,11 @@ New pure-Python file under `laptop/`. Dependency: `python-telegram-bot`.
 | 左转 / 右转                       | move rotate_left / right  |
 | 停 / 停下 / 停止                  | stop                      |
 | 拍照 / 照片 / 看看                | photo                     |
+| 旋转拍照 / 环拍 / 转一圈拍照      | rotate_photo              |
 | 找X / 去找X / 寻找X / 靠近X       | find, target=X            |
+
+Parse order matters: `旋转拍照` contains `拍照`, so the `rotate_photo` keyword
+must be tested before the plain `photo` keyword.
 
 **Target name map (Chinese → COCO class):** small table for common objects —
 `瓶子/水瓶→bottle`, `椅子→chair`, `人→person`, `杯子→cup`, `手机→cell phone`,
@@ -144,6 +164,8 @@ obeyed; messages from other users are ignored.
    (a `--dry-run` flag prints the parse without POSTing).
 4. **End-to-end** — phone "前进" → car steps; "拍照" → photo received;
    "去找瓶子" → car searches, arrives, auto-sends photo; mid-task "停" → stops.
+   "旋转拍照" → car turns in place, 4 labelled photos arrive, ends ≈ original
+   heading, "旋转拍照完成" sent.
 5. **Regression** — the original autonomous `mvp.launch.py` flow still works
    (agent_node defaults to IDLE; existing search behavior intact under SEARCH).
 
