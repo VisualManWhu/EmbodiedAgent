@@ -10,8 +10,9 @@ camera:
     hflip: true                  # camera mounted upside-down -> 180 deg
     vflip: true
     frame_id: camera_link
-    shutter_us: 8000             # short exposure -> freeze motion blur (0=auto)
+    shutter_us: 0                # 0 = auto exposure (stop-and-scan covers blur)
     gain: 0.0                    # 0 = auto gain
+    mjpeg_quality: 80            # rpicam-vid MJPEG quality 1-100
 
 motor_node:
   ros__parameters:
@@ -23,10 +24,10 @@ motor_node:
     serial_baud: 115200
     cmd_timeout_sec: 0.5
     speed_gain: 200.0            # wheel_norm * gain -> PCA9685 duty percent
-    min_move_percent: 35.0       # floor to overcome motor stall
-    max_move_percent: 65.0       # cap duty -> limit peak current draw
+    min_move_percent: 30.0       # floor to overcome motor stall
+    max_move_percent: 45.0       # cap duty -> limit peak current draw
     move_eps: 0.01               # below this wheel_norm -> stop that motor
-    slew_per_sec: 2.5            # wheel ramp rate (anti current-spike)
+    slew_per_sec: 1.5            # wheel ramp rate (anti current-spike)
     update_rate_hz: 50.0
 
 ir_node:
@@ -75,6 +76,17 @@ yolo_node:
     classes_whitelist: ['']      # empty = all COCO classes
     inference_every_n: 1
 
+mjpeg_node:
+  ros__parameters:
+    topic: /camera/image_raw     # laptop detector reads this stream
+    port: 8080
+    quality: 60
+    fps_cap: 20.0
+
+det_bridge_node:
+  ros__parameters:
+    port: 9090                   # laptop POSTs detections here
+
 search_node:
   ros__parameters:
     target_class: chair
@@ -89,11 +101,22 @@ search_node:
     search_yaw_speed: 0.25
     search_pitch_sweep_rad: 0.0    # 0 = no pan-tilt sweep, hold centered
     search_pitch_period_sec: 8.0
+    search_rotate_sec: 0.5         # stop-and-scan: rotate burst length
+    search_dwell_sec: 1.3          # stop-and-scan: still dwell for clean frames
     stop_distance_m: 0.4
-    arrived_bbox_area_ratio: 0.25
-    det_conf_min: 0.4
-    confirm_frames: 3
-    lost_timeout_sec: 1.0
+    arrived_height_ratio: 0.75    # bbox height / frame height -> stop (vision distance, sonar-independent)
+    det_conf_min: 0.25            # accept lower-confidence detections (small/far bottle)
+    confirm_frames: 2             # (unused — lock is now time-windowed)
+    lost_timeout_sec: 5.0         # tolerate detection dropouts before re-scanning
+    # APPROACHING discrete-pulse params (one move per fresh detection).
+    fresh_window_sec: 1.5         # max detection age to act on
+    approach_step_sec: 0.3        # rotation pulse duration
+    approach_fwd_step_sec: 0.7    # forward pulse duration (longer = faster approach)
+    approach_yaw_speed: 0.4       # rotation pulse speed (rad/s)
+    approach_fwd_speed: 0.15      # forward pulse speed
+    recenter_px: 160.0            # |err_x| beyond this -> pure re-aim rotation
+    approach_steer_gain: 0.0012   # forward-pulse steering gain (rad/s per px)
+    approach_steer_max: 0.22      # cap on forward-pulse steering
     search_timeout_sec: 60.0
     side_ir_enabled: true
     avoid_yaw_bias: 0.35

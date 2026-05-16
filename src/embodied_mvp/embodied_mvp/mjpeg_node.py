@@ -62,7 +62,27 @@ class MjpegNode(Node):
             def log_message(self, *args):
                 pass
 
-            def do_GET(self):
+            def _send_snapshot(self):
+                # Single current JPEG. The laptop detector polls this so there
+                # is no stream pipe to buffer up -> minimal latency.
+                with node.lock:
+                    jpg = node.latest
+                if jpg is None:
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Content-Length', str(len(jpg)))
+                self.send_header('Cache-Control', 'no-cache')
+                self.end_headers()
+                try:
+                    self.wfile.write(jpg)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def _send_stream(self):
+                # Multipart MJPEG for browser viewing.
                 self.send_response(200)
                 self.send_header(
                     'Content-Type',
@@ -85,6 +105,12 @@ class MjpegNode(Node):
                         time.sleep(node.frame_dt)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+
+            def do_GET(self):
+                if self.path.startswith('/snapshot'):
+                    self._send_snapshot()
+                else:
+                    self._send_stream()
 
         self._server = ThreadingHTTPServer(('0.0.0.0', self.port), Handler)
         t = threading.Thread(target=self._server.serve_forever, daemon=True)

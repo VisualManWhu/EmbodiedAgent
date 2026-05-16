@@ -1,7 +1,13 @@
 """MVP all-up launch.
 
+Default = offloaded detection: YOLO runs on the laptop, det_bridge_node
+receives results. Keeps Pi5 CPU/current low (avoids motor-battery BMS trip).
+
 Usage:
-  ros2 launch embodied_mvp mvp.launch.py target_class:=chair
+  ros2 launch embodied_mvp mvp.launch.py target_class:=bottle
+
+Run YOLO on the Pi instead (no laptop):
+  ros2 launch embodied_mvp mvp.launch.py enable_yolo:=true enable_bridge:=false
 
 Override params file:
   ros2 launch embodied_mvp mvp.launch.py params_file:=/path/to/params.yaml
@@ -22,12 +28,18 @@ def generate_launch_description():
     params_file = LaunchConfiguration('params_file')
     enable_yolo = LaunchConfiguration('enable_yolo')
     enable_search = LaunchConfiguration('enable_search')
+    enable_stream = LaunchConfiguration('enable_stream')
+    enable_bridge = LaunchConfiguration('enable_bridge')
+
+    IfCondition = __import__('launch.conditions', fromlist=['IfCondition']).IfCondition
 
     return LaunchDescription([
         DeclareLaunchArgument('target_class', default_value='chair'),
         DeclareLaunchArgument('params_file', default_value=default_params),
-        DeclareLaunchArgument('enable_yolo', default_value='true'),
+        DeclareLaunchArgument('enable_yolo', default_value='false'),    # YOLO offloaded to laptop
         DeclareLaunchArgument('enable_search', default_value='true'),
+        DeclareLaunchArgument('enable_stream', default_value='true'),
+        DeclareLaunchArgument('enable_bridge', default_value='true'),   # receive laptop detections
 
         # CSI camera: custom node spawns system rpicam-vid, publishes /camera/image_raw.
         Node(
@@ -44,15 +56,22 @@ def generate_launch_description():
         Node(package='embodied_mvp', executable='pantilt_node', name='pantilt_node',
              parameters=[params_file]),
 
-        GroupAction([
-            Node(package='embodied_mvp', executable='yolo_node', name='yolo_node',
-                 parameters=[params_file],
-                 condition=__import__('launch.conditions', fromlist=['IfCondition']).IfCondition(enable_yolo)),
-        ]),
+        # On-Pi YOLO (off by default — detection is offloaded to the laptop).
+        Node(package='embodied_mvp', executable='yolo_node', name='yolo_node',
+             parameters=[params_file],
+             condition=IfCondition(enable_yolo)),
 
-        GroupAction([
-            Node(package='embodied_mvp', executable='search_node', name='search_node',
-                 parameters=[params_file, {'target_class': target_class}],
-                 condition=__import__('launch.conditions', fromlist=['IfCondition']).IfCondition(enable_search)),
-        ]),
+        # Receives detections POSTed by the laptop GPU detector -> /detections.
+        Node(package='embodied_mvp', executable='det_bridge_node', name='det_bridge_node',
+             parameters=[params_file],
+             condition=IfCondition(enable_bridge)),
+
+        Node(package='embodied_mvp', executable='search_node', name='search_node',
+             parameters=[params_file, {'target_class': target_class}],
+             condition=IfCondition(enable_search)),
+
+        # Browser-viewable MJPEG stream at http://<pi-ip>:8080/
+        Node(package='embodied_mvp', executable='mjpeg_node', name='mjpeg_node',
+             parameters=[params_file],
+             condition=IfCondition(enable_stream)),
     ])

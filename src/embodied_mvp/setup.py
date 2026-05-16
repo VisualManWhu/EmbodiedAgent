@@ -29,6 +29,7 @@ setup(
             'yolo_node = embodied_mvp.yolo_node:main',
             'search_node = embodied_mvp.search_node:main',
             'mjpeg_node = embodied_mvp.mjpeg_node:main',
+            'det_bridge_node = embodied_mvp.det_bridge_node:main',
         ],
     },
 )

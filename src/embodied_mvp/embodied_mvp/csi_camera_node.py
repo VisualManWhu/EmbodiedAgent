@@ -2,8 +2,11 @@
 
 RoboStack's conda libcamera can't enumerate the Pi5 CSI camera (missing PiSP
 IPA modules). Workaround: spawn the SYSTEM `rpicam-vid` binary (which uses the
-working system libcamera), read its raw YUV420 stdout stream, decode with
+working system libcamera), read its MJPEG stdout stream, decode each JPEG with
 OpenCV inside the conda env, and publish sensor_msgs/Image.
+
+MJPEG (not raw YUV420) is used because cv2.imdecode produces unambiguous BGR —
+raw YUV plane-order (I420 vs YV12) guesswork caused a colour cast.
 
 No python/libcamera bindings are imported here — only a subprocess pipe — so
 there is no ABI clash with the conda numpy/opencv.
@@ -11,18 +14,26 @@ there is no ABI clash with the conda numpy/opencv.
 Params:
   rpicam_bin   : binary name (rpicam-vid, fallback libcamera-vid)
   width/height : capture resolution
-  framerate    : fps
+  framerate    : publish rate
   hflip/vflip  : image flips
+  shutter_us   : fixed exposure in microseconds, 0 = auto
+  gain         : fixed analogue gain, 0 = auto
+  mjpeg_quality: rpicam-vid MJPEG quality 1-100
   frame_id     : header frame_id
 """
 import os
 import subprocess
-import numpy as np
+import threading
+
 import cv2
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
+
+SOI = b'\xff\xd8'   # JPEG start-of-image
+EOI = b'\xff\xd9'   # JPEG end-of-image
 
 
 class CsiCameraNode(Node):
@@ -35,34 +46,35 @@ class CsiCameraNode(Node):
         self.declare_parameter('framerate', 15)
         self.declare_parameter('hflip', False)
         self.declare_parameter('vflip', False)
+        self.declare_parameter('shutter_us', 0)      # 0 = auto exposure
+        self.declare_parameter('gain', 0.0)          # 0 = auto gain
+        self.declare_parameter('mjpeg_quality', 80)
         self.declare_parameter('frame_id', 'camera_link')
-        # Exposure: short shutter freezes motion blur while the car moves.
-        # 0 = auto. Indoors try 6000-10000 us (1/165 - 1/100 s).
-        self.declare_parameter('shutter_us', 0)
-        self.declare_parameter('gain', 0.0)        # 0 = auto analogue gain
 
         self.w = int(self.get_parameter('width').value)
         self.h = int(self.get_parameter('height').value)
         self.fps = int(self.get_parameter('framerate').value)
         self.frame_id = self.get_parameter('frame_id').value
-        # YUV420 (I420): Y plane h*w + U,V each (h/2)*(w/2) -> total w*h*3/2
-        self.frame_bytes = self.w * self.h * 3 // 2
 
         self.bridge = CvBridge()
         self.pub = self.create_publisher(Image, '/camera/image_raw', 5)
 
+        self._lock = threading.Lock()
+        self._latest = None
+        self._running = True
+        self._dead = False
+
         self._proc = self._start_rpicam()
-        # Read frames in a wall-clock timer; pulls whatever is buffered.
+        threading.Thread(target=self._reader_loop, daemon=True).start()
         self.create_timer(1.0 / max(1, self.fps), self.tick)
         self.get_logger().info(
-            f'camera (CSI via rpicam-vid) {self.w}x{self.h}@{self.fps} ready')
+            f'camera (CSI via rpicam-vid MJPEG) {self.w}x{self.h}@{self.fps} ready')
 
     def _system_env(self):
         """Env for the rpicam-vid subprocess: strip conda paths so the SYSTEM
         binary loads SYSTEM libs (conda libstdc++/libcamera would crash it)."""
         env = os.environ.copy()
         conda = env.get('CONDA_PREFIX', '')
-        # Drop conda from LD_LIBRARY_PATH; system ld.so.cache resolves the rest.
         ld = env.get('LD_LIBRARY_PATH', '')
         if ld:
             kept = [p for p in ld.split(':') if p and (not conda or conda not in p)]
@@ -71,7 +83,6 @@ class CsiCameraNode(Node):
             else:
                 env.pop('LD_LIBRARY_PATH', None)
         env.pop('LD_PRELOAD', None)
-        # Ensure system bin dirs are on PATH to find rpicam-vid.
         env['PATH'] = '/usr/bin:/bin:/usr/local/bin:' + env.get('PATH', '')
         return env
 
@@ -81,7 +92,8 @@ class CsiCameraNode(Node):
             binname, '-t', '0', '--nopreview',
             '--width', str(self.w), '--height', str(self.h),
             '--framerate', str(self.fps),
-            '--codec', 'yuv420',
+            '--codec', 'mjpeg',
+            '--quality', str(int(self.get_parameter('mjpeg_quality').value)),
             '--flush', '1',
             '-o', '-',
         ]
@@ -96,14 +108,41 @@ class CsiCameraNode(Node):
         if gain > 0:
             cmd += ['--gain', str(gain)]
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+            return subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, bufsize=0,
                                     env=self._system_env())
         except FileNotFoundError:
             self.get_logger().error(
                 f'{binname} not found. Try param rpicam_bin:=libcamera-vid')
             raise
-        return proc
+
+    def _reader_loop(self):
+        """Continuously read MJPEG bytes, split into JPEG frames, decode."""
+        buf = b''
+        while self._running and rclpy.ok():
+            chunk = self._proc.stdout.read(8192)
+            if not chunk:
+                self._dead = True
+                self.get_logger().error('rpicam-vid stream ended')
+                self._log_proc_stderr()
+                return
+            buf += chunk
+            while True:
+                s = buf.find(SOI)
+                if s < 0:
+                    buf = b''
+                    break
+                e = buf.find(EOI, s + 2)
+                if e < 0:
+                    buf = buf[s:]          # keep partial frame
+                    break
+                jpg = buf[s:e + 2]
+                buf = buf[e + 2:]
+                frame = cv2.imdecode(np.frombuffer(jpg, np.uint8),
+                                     cv2.IMREAD_COLOR)
+                if frame is not None:
+                    with self._lock:
+                        self._latest = frame
 
     def _log_proc_stderr(self):
         try:
@@ -114,37 +153,18 @@ class CsiCameraNode(Node):
         except Exception:
             pass
 
-    def _read_exact(self, n):
-        buf = bytearray()
-        while len(buf) < n:
-            chunk = self._proc.stdout.read(n - len(buf))
-            if not chunk:
-                return None
-            buf.extend(chunk)
-        return bytes(buf)
-
     def tick(self):
-        if getattr(self, '_dead', False):
+        with self._lock:
+            frame = self._latest
+        if frame is None:
             return
-        if self._proc.poll() is not None:
-            self._dead = True
-            self.get_logger().error('rpicam-vid exited; camera stream dead')
-            self._log_proc_stderr()
-            return
-        raw = self._read_exact(self.frame_bytes)
-        if raw is None:
-            self._dead = True
-            self.get_logger().warn('camera stream EOF')
-            self._log_proc_stderr()
-            return
-        yuv = np.frombuffer(raw, dtype=np.uint8).reshape(self.h * 3 // 2, self.w)
-        bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
-        msg = self.bridge.cv2_to_imgmsg(bgr, encoding='bgr8')
+        msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.frame_id
         self.pub.publish(msg)
 
     def destroy_node(self):
+        self._running = False
         try:
             if self._proc and self._proc.poll() is None:
                 self._proc.terminate()
