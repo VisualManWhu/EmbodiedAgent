@@ -1,0 +1,99 @@
+# Default params. All backends start as `mock` so the stack runs without hardware.
+# Switch backends after confirming kit specifics (motor protocol, IR interface, servo board).
+
+camera:
+  ros__parameters:
+    rpicam_bin: rpicam-vid       # fallback: libcamera-vid (older OS)
+    width: 640
+    height: 480
+    framerate: 15
+    hflip: true                  # camera mounted upside-down -> 180 deg
+    vflip: true
+    frame_id: camera_link
+    shutter_us: 8000             # short exposure -> freeze motion blur (0=auto)
+    gain: 0.0                    # 0 = auto gain
+
+motor_node:
+  ros__parameters:
+    backend: loborobot          # mock | serial | loborobot (Makerobo kit)
+    wheel_base_lx: 0.08          # half wheelbase along x (m), measure your car
+    wheel_base_ly: 0.085         # half wheelbase along y (m)
+    max_wheel_speed: 1.0         # normalized; tune per driver scaling
+    serial_port: /dev/ttyAMA0
+    serial_baud: 115200
+    cmd_timeout_sec: 0.5
+    speed_gain: 200.0            # wheel_norm * gain -> PCA9685 duty percent
+    min_move_percent: 35.0       # floor to overcome motor stall
+    max_move_percent: 65.0       # cap duty -> limit peak current draw
+    move_eps: 0.01               # below this wheel_norm -> stop that motor
+    slew_per_sec: 2.5            # wheel ramp rate (anti current-spike)
+    update_rate_hz: 50.0
+
+ir_node:
+  ros__parameters:
+    backend: ultrasonic         # mock | ultrasonic (HC-SR04, Makerobo kit)
+    rate_hz: 10.0
+    min_range_m: 0.02
+    max_range_m: 3.0
+    field_of_view_rad: 0.26
+    frame_id: ultrasonic_link
+    smoothing_window: 5
+    trigger_pin: 20
+    echo_pin: 21
+
+side_ir_node:
+  ros__parameters:
+    backend: gpio               # mock | gpio (Makerobo binary IR)
+    rate_hz: 10.0
+    left_pin: 12
+    right_pin: 16
+
+pantilt_node:
+  ros__parameters:
+    backend: loborobot          # mock | loborobot (Makerobo kit)
+    i2c_address: 0x40
+    pan_channel: 10              # base servo (Makerobo notebook 11)
+    tilt_channel: 9              # top servo
+    pan_center_deg: 90.0
+    tilt_center_deg: -10.0
+    pan_min_deg: -90.0
+    pan_max_deg: 180.0
+    tilt_min_deg: -10.0
+    tilt_max_deg: 90.0
+    pan_invert: false
+    tilt_invert: false
+    pwm_freq_hz: 50
+
+yolo_node:
+  ros__parameters:
+    backend: ultralytics         # ultralytics | ncnn (set model_path to *_ncnn_model dir)
+    model_path: yolov8n.pt
+    imgsz: 320
+    conf_threshold: 0.4
+    iou_threshold: 0.5
+    publish_annotated: true
+    classes_whitelist: ['']      # empty = all COCO classes
+    inference_every_n: 1
+
+search_node:
+  ros__parameters:
+    target_class: chair
+    image_width: 640
+    image_height: 480
+    control_rate_hz: 10.0
+    kp_yaw: 0.004
+    kp_fwd: 0.6
+    max_fwd_speed: 0.18
+    max_yaw_speed: 0.6
+    yaw_deadband_px: 20.0
+    search_yaw_speed: 0.25
+    search_pitch_sweep_rad: 0.0    # 0 = no pan-tilt sweep, hold centered
+    search_pitch_period_sec: 8.0
+    stop_distance_m: 0.4
+    arrived_bbox_area_ratio: 0.25
+    det_conf_min: 0.4
+    confirm_frames: 3
+    lost_timeout_sec: 1.0
+    search_timeout_sec: 60.0
+    side_ir_enabled: true
+    avoid_yaw_bias: 0.35

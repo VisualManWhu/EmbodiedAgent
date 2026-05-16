@@ -1,0 +1,22 @@
+# colcon build artifacts
+build/
+install/
+log/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# yolo models (downloaded / exported at runtime, not source)
+*.pt
+*.onnx
+*_ncnn_model/
+
+# ROS runtime
+.ros/
+
+# OS
+.DS_Store
+Thumbs.db
