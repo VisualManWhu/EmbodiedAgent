@@ -20,9 +20,9 @@ from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filte
 from nl_parser import parse, SUPPORTED_TARGETS_CN
 
 # ---- config ----
-BOT_TOKEN = '8878267348:AAHUvp9Af7LPTOJTMvmNxJEm7b_vTJ1_vuQ'
-PI_IP = '192.168.178.37'
-AUTHORIZED_IDS = {8641899501}        # your Telegram numeric user id(s)
+BOT_TOKEN = ''
+PI_IP = ''
+AUTHORIZED_IDS = {}        # your Telegram numeric user id(s)
 # ----------------
 
 CMD_URL = f'http://{PI_IP}:9091/command'
