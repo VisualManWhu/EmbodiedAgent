@@ -120,3 +120,10 @@ agent_node:
     search_timeout_sec: 60.0
     side_ir_enabled: true
     avoid_yaw_bias: 0.35
+    command_port: 9091
+    manual_step_sec: 1.0
+    manual_fwd_speed: 0.15
+    manual_strafe_speed: 0.15
+    manual_yaw_speed: 0.5
+    rotate_90_sec: 1.4            # calibrate: time for a ~90 deg in-place turn
+    photo_dwell_sec: 2.0

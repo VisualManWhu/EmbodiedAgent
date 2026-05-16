@@ -1,14 +1,18 @@
 """Search behavior FSM. Hunts for `target_class` via visual servoing + IR stop.
 
-States:
+Modes:
+  IDLE          — robot stopped, waiting for a command.
+  MANUAL        — phone-bot is driving; execute one timed movement step.
+  SEARCH        — autonomous object search (sub-states SEARCHING/APPROACHING).
+  ROTATE_PHOTO  — rotate 360° in four 90-deg steps, dwelling for a photo each step.
+
+Search sub-states (active only while mode == SEARCH):
   SEARCHING   — no recent target: rotate in place, pan-tilt scans up/down.
   APPROACHING — target seen: P-controller drives bbox center to image center and bbox area to target_area.
-  ARRIVED     — target bbox tall enough in frame (vision distance proxy), or
-                IR < stop_distance: zero velocity, announce.
 
 Re-acquire window: target lost > lost_timeout_sec → back to SEARCHING.
 Search timeout: every search_timeout_sec without a sighting → log a warning and
-keep searching (non-terminal; only ARRIVED on the target stops the robot).
+keep searching (non-terminal; only arrival at the target stops the robot).
 """
 import math
 import time
@@ -67,6 +71,15 @@ class AgentNode(Node):
         self.declare_parameter('side_ir_enabled', True)
         self.declare_parameter('avoid_yaw_bias', 0.35)   # rad/s steer away per side hit
 
+        # Mode FSM / command server params.
+        self.declare_parameter('command_port', 9091)
+        self.declare_parameter('manual_step_sec', 1.0)
+        self.declare_parameter('manual_fwd_speed', 0.15)
+        self.declare_parameter('manual_strafe_speed', 0.15)
+        self.declare_parameter('manual_yaw_speed', 0.5)
+        self.declare_parameter('rotate_90_sec', 1.4)
+        self.declare_parameter('photo_dwell_sec', 2.0)
+
         p = self.get_parameter
         self.target_class = p('target_class').value
         self.W = int(p('image_width').value)
@@ -103,6 +116,13 @@ class AgentNode(Node):
         self.side_ir_enabled = p('side_ir_enabled').value
         self.avoid_bias = p('avoid_yaw_bias').value
 
+        self.manual_step_sec = p('manual_step_sec').value
+        self.manual_fwd = p('manual_fwd_speed').value
+        self.manual_strafe = p('manual_strafe_speed').value
+        self.manual_yaw = p('manual_yaw_speed').value
+        self.rotate_90_sec = p('rotate_90_sec').value
+        self.photo_dwell_sec = p('photo_dwell_sec').value
+
         self.state = 'SEARCHING'
         self.last_target = None
         self.last_target_time = 0.0
@@ -138,6 +158,17 @@ class AgentNode(Node):
         period = 1.0 / float(p('control_rate_hz').value)
         self.create_timer(period, self.tick)
         self.get_logger().info(f'agent_node hunting target_class="{self.target_class}"')
+
+        from embodied_mvp.command_server import CommandServer
+        self.mode = 'IDLE'
+        self.manual_twist = (0.0, 0.0, 0.0)   # vx, vy, wz
+        self.manual_deadline = 0.0
+        self.rp_index = 0
+        self.rp_phase = 'dwell'
+        self.rp_phase_start = 0.0
+        self.cmd_server = CommandServer(self.get_parameter('command_port').value)
+        self.get_logger().info(
+            f"agent_node command server on :{self.get_parameter('command_port').value}")
 
     def on_image_meta(self, msg: Image):
         if msg.width != self.W or msg.height != self.H:
@@ -194,13 +225,69 @@ class AgentNode(Node):
         t.angular.z = max(-self.w_max, min(self.w_max, wz))
         self.cmd_pub.publish(t)
 
+    def publish_full_cmd(self, vx, vy, wz):
+        t = Twist()
+        t.linear.x = vx
+        t.linear.y = vy
+        t.angular.z = wz
+        self.cmd_pub.publish(t)
+
     def publish_pantilt(self, yaw: float, pitch: float):
         v = Vector3()
         v.x = yaw
         v.y = pitch
         self.pt_pub.publish(v)
 
-    def tick(self):
+    def _dir_to_twist(self, direction):
+        f, s, y = self.manual_fwd, self.manual_strafe, self.manual_yaw
+        return {
+            'forward':      (f,  0.0, 0.0),
+            'backward':     (-f, 0.0, 0.0),
+            'left':         (0.0,  s, 0.0),
+            'right':        (0.0, -s, 0.0),
+            'rotate_left':  (0.0, 0.0,  y),
+            'rotate_right': (0.0, 0.0, -y),
+        }.get(direction, (0.0, 0.0, 0.0))
+
+    def apply_command(self, cmd, now):
+        action = cmd.get('action')
+        if action == 'stop':
+            self.mode = 'IDLE'
+        elif action == 'move':
+            self.mode = 'MANUAL'
+            self.manual_twist = self._dir_to_twist(cmd.get('dir'))
+            self.manual_deadline = now + self.manual_step_sec
+        elif action == 'find':
+            target = cmd.get('target')
+            if target:
+                self.target_class = target
+                self.reset_search(now)
+                self.mode = 'SEARCH'
+        elif action == 'rotate_photo':
+            self.mode = 'ROTATE_PHOTO'
+            self.rp_index = 0
+            self.rp_phase = 'dwell'
+            self.rp_phase_start = now
+            self.cmd_server.post_event('photo_ready:1')
+        self.get_logger().info(f'command {cmd} -> mode {self.mode}')
+
+    def reset_search(self, now):
+        self.state = 'SEARCHING'
+        self.last_target = None
+        self.last_target_time = 0.0
+        self.start_time = now
+        self.consec_hits = 0
+        self.scan_phase = 'rotate'
+        self.scan_phase_start = now
+        self.scan_dir = 1.0
+        self.scan_bursts = 0
+        self.reacquire_until = 0.0
+        self.burst_end = 0.0
+        self.burst_vx = 0.0
+        self.burst_wz = 0.0
+        self.last_acted_time = 0.0
+
+    def tick_search(self):
         now = time.time()
         elapsed_since_seen = now - self.last_target_time if self.last_target else float('inf')
 
@@ -221,10 +308,6 @@ class AgentNode(Node):
             self.last_target is not None
             and elapsed_since_seen < self.lost_to
         )
-
-        if self.state == 'ARRIVED':
-            self.publish_cmd(0.0, 0.0)
-            return
 
         if now - self.start_time > self.search_to and self.state == 'SEARCHING':
             # Non-terminal: log and keep searching (don't lock up the robot).
@@ -293,7 +376,9 @@ class AgentNode(Node):
             self.get_logger().info(
                 f'Found {self.target_class}! height_frac={height_frac:.2f} '
                 f'ir={self.ir_range:.2f}m')
-            self.state = 'ARRIVED'
+            self.cmd_server.post_event(f'arrived:{self.target_class}')
+            self.mode = 'IDLE'
+            self.state = 'SEARCHING'
             return
 
         if now < self.burst_end:
@@ -330,6 +415,51 @@ class AgentNode(Node):
                 self.burst_wz = 0.0
             self.burst_end = now + self.fwd_step_sec
 
+    def tick_manual(self, now):
+        if now >= self.manual_deadline:
+            self.mode = 'IDLE'
+            self.publish_full_cmd(0.0, 0.0, 0.0)
+            return
+        vx, vy, wz = self.manual_twist
+        self.publish_full_cmd(vx, vy, wz)
+
+    def tick_rotate_photo(self, now):
+        phase_t = now - self.rp_phase_start
+        if self.rp_phase == 'dwell':
+            self.publish_full_cmd(0.0, 0.0, 0.0)
+            if phase_t >= self.photo_dwell_sec:
+                self.rp_phase = 'rotate'
+                self.rp_phase_start = now
+        else:  # rotate ~90 deg
+            self.publish_full_cmd(0.0, 0.0, self.manual_yaw)
+            if phase_t >= self.rotate_90_sec:
+                self.rp_index += 1
+                if self.rp_index >= 4:
+                    self.mode = 'IDLE'
+                    self.cmd_server.post_event('rotate_photo_done')
+                else:
+                    self.rp_phase = 'dwell'
+                    self.rp_phase_start = now
+                    self.cmd_server.post_event(f'photo_ready:{self.rp_index + 1}')
+
+    def tick(self):
+        now = time.time()
+        cmd = self.cmd_server.take_command()
+        if cmd is not None:
+            self.apply_command(cmd, now)
+
+        if self.mode == 'IDLE':
+            self.publish_full_cmd(0.0, 0.0, 0.0)
+            self.publish_pantilt(0.0, 0.0)
+        elif self.mode == 'MANUAL':
+            self.tick_manual(now)
+        elif self.mode == 'SEARCH':
+            self.tick_search()
+        elif self.mode == 'ROTATE_PHOTO':
+            self.tick_rotate_photo(now)
+
+        self.cmd_server.set_mode(self.mode)
+
 
 def main():
     rclpy.init()
@@ -338,6 +468,7 @@ def main():
         rclpy.spin(node)
     finally:
         node.publish_cmd(0.0, 0.0)
+        node.cmd_server.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
