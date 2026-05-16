@@ -126,4 +126,5 @@ agent_node:
     manual_strafe_speed: 0.15
     manual_yaw_speed: 0.5
     rotate_90_sec: 1.4            # calibrate: time for a ~90 deg in-place turn
-    photo_dwell_sec: 2.0
+    photo_dwell_sec: 3.0          # total still time per photo step
+    photo_settle_sec: 1.2         # wait after a turn before the photo (sharp frame)

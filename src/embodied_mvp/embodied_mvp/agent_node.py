@@ -78,7 +78,8 @@ class AgentNode(Node):
         self.declare_parameter('manual_strafe_speed', 0.15)
         self.declare_parameter('manual_yaw_speed', 0.5)
         self.declare_parameter('rotate_90_sec', 1.4)
-        self.declare_parameter('photo_dwell_sec', 2.0)
+        self.declare_parameter('photo_dwell_sec', 3.0)
+        self.declare_parameter('photo_settle_sec', 1.2)  # wait after a turn before the photo (sharp frame)
 
         p = self.get_parameter
         self.target_class = p('target_class').value
@@ -122,6 +123,7 @@ class AgentNode(Node):
         self.manual_yaw = p('manual_yaw_speed').value
         self.rotate_90_sec = p('rotate_90_sec').value
         self.photo_dwell_sec = p('photo_dwell_sec').value
+        self.photo_settle_sec = p('photo_settle_sec').value
 
         self.state = 'SEARCHING'
         self.last_target = None
@@ -166,6 +168,7 @@ class AgentNode(Node):
         self.rp_index = 0
         self.rp_phase = 'dwell'
         self.rp_phase_start = 0.0
+        self.rp_photo_posted = False
         self.cmd_server = CommandServer(self.get_parameter('command_port').value)
         self.get_logger().info(
             f"agent_node command server on :{self.get_parameter('command_port').value}")
@@ -268,7 +271,8 @@ class AgentNode(Node):
             self.rp_index = 0
             self.rp_phase = 'dwell'
             self.rp_phase_start = now
-            self.cmd_server.post_event('photo_ready:1')
+            self.rp_photo_posted = False
+            # photo_ready:1 is posted by tick_rotate_photo after the settle delay
         self.get_logger().info(f'command {cmd} -> mode {self.mode}')
 
     def reset_search(self, now):
@@ -427,6 +431,11 @@ class AgentNode(Node):
         phase_t = now - self.rp_phase_start
         if self.rp_phase == 'dwell':
             self.publish_full_cmd(0.0, 0.0, 0.0)
+            # Post the photo event only AFTER the car has settled, so the
+            # camera frame is sharp (not blurred from the just-ended turn).
+            if phase_t >= self.photo_settle_sec and not self.rp_photo_posted:
+                self.cmd_server.post_event(f'photo_ready:{self.rp_index + 1}')
+                self.rp_photo_posted = True
             if phase_t >= self.photo_dwell_sec:
                 self.rp_phase = 'rotate'
                 self.rp_phase_start = now
@@ -440,7 +449,7 @@ class AgentNode(Node):
                 else:
                     self.rp_phase = 'dwell'
                     self.rp_phase_start = now
-                    self.cmd_server.post_event(f'photo_ready:{self.rp_index + 1}')
+                    self.rp_photo_posted = False
 
     def tick(self):
         now = time.time()
