@@ -20,14 +20,16 @@ from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filte
 from nl_parser import parse, SUPPORTED_TARGETS_CN
 
 # ---- config ----
-BOT_TOKEN = 'PUT-YOUR-BOTFATHER-TOKEN-HERE'
+BOT_TOKEN = '8878267348:AAHUvp9Af7LPTOJTMvmNxJEm7b_vTJ1_vuQ'
 PI_IP = '192.168.178.37'
-AUTHORIZED_IDS = {123456789}        # your Telegram numeric user id(s)
+AUTHORIZED_IDS = {8641899501}        # your Telegram numeric user id(s)
 # ----------------
 
 CMD_URL = f'http://{PI_IP}:9091/command'
 STATUS_URL = f'http://{PI_IP}:9091/status'
 SNAPSHOT_URL = f'http://{PI_IP}:8080/snapshot'
+# laptop_detector serves detection-boxed frames here (same laptop as the bot)
+DETECTOR_URL = 'http://127.0.0.1:8090/annotated'
 
 HELP = ('支持指令：前进/后退/左移/右移/左转/右转/停/拍照/旋转拍照/'
         '去找<目标>。目标：' + SUPPORTED_TARGETS_CN)
@@ -46,14 +48,17 @@ def post_command(cmd):
         return False
 
 
-def fetch_snapshot():
-    """GET the current camera frame. Returns JPEG bytes or None."""
-    try:
-        r = _session.get(SNAPSHOT_URL, timeout=3.0)
-        if r.status_code == 200:
-            return r.content
-    except requests.RequestException:
-        pass
+def fetch_photo():
+    """Return JPEG bytes of the current view. Prefer the detector's
+    detection-boxed frame; fall back to the Pi's raw camera snapshot if the
+    detector is not running."""
+    for url in (DETECTOR_URL, SNAPSHOT_URL):
+        try:
+            r = _session.get(url, timeout=3.0)
+            if r.status_code == 200:
+                return r.content
+        except requests.RequestException:
+            pass
     return None
 
 
@@ -65,7 +70,7 @@ def get_status():
 
 
 async def _send_photo(context, chat_id, caption):
-    jpg = fetch_snapshot()
+    jpg = fetch_photo()
     if jpg is None:
         await context.bot.send_message(chat_id, '取图失败')
         return
