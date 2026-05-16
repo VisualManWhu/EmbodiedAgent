@@ -106,3 +106,18 @@ yolo_node:
 3. Expect: rotate → spot chair → drive forward, recentering → IR < 0.4 m → stop, log `Found chair!`
 
 Failure modes and tuning are listed in the plan file.
+
+## Phone control (Telegram)
+
+Run YOLO offload as usual (`laptop_detector.py`), plus the bot:
+
+1. Create a bot via @BotFather, get the token.
+2. Edit `laptop/telegram_bot.py` — set `BOT_TOKEN`, `PI_IP`, `AUTHORIZED_IDS`.
+3. `pip install python-telegram-bot requests`
+4. `python laptop/telegram_bot.py`
+
+Commands (Chinese): 前进 / 后退 / 左移 / 右移 / 左转 / 右转 / 停 /
+拍照 / 旋转拍照 / 去找<目标>（瓶子、椅子、人 ...）.
+
+`agent_node` on the Pi receives commands on port 9091 and is the sole
+/cmd_vel owner (modes: IDLE / MANUAL / SEARCH / ROTATE_PHOTO).

@@ -67,8 +67,7 @@ def generate_launch_description():
              condition=IfCondition(enable_bridge)),
 
         Node(package='embodied_mvp', executable='agent_node', name='agent_node',
-             parameters=[params_file, {'target_class': target_class}],
-             condition=IfCondition(enable_search)),
+             parameters=[params_file, {'target_class': target_class}]),
 
         # Browser-viewable MJPEG stream at http://<pi-ip>:8080/
         Node(package='embodied_mvp', executable='mjpeg_node', name='mjpeg_node',
