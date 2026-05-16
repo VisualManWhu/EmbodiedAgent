@@ -76,8 +76,8 @@ def main():
     ap.add_argument('--bridge-port', type=int, default=9090)
     ap.add_argument('--annotated-port', type=int, default=8090,
                     help='local port serving annotated frames to the bot')
-    ap.add_argument('--model', default='yolov8m.pt')  # RTX 4060 runs m fast; far better small-object recall than n
-    ap.add_argument('--conf', type=float, default=0.25)
+    ap.add_argument('--model', default='yolov8x.pt')  # strongest YOLOv8; RTX 4060 8GB runs it fine, best classification
+    ap.add_argument('--conf', type=float, default=0.4)  # cut low-confidence misclassifications (car<->airplane flicker)
     ap.add_argument('--imgsz', type=int, default=640)
     ap.add_argument('--device', default='0', help="GPU index, or 'cpu'")
     ap.add_argument('--no-show', action='store_true', help='disable preview window')
