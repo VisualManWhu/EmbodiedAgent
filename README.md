@@ -121,3 +121,16 @@ Commands (Chinese): 前进 / 后退 / 左移 / 右移 / 左转 / 右转 / 停 /
 
 `agent_node` on the Pi receives commands on port 9091 and is the sole
 /cmd_vel owner (modes: IDLE / MANUAL / SEARCH / ROTATE_PHOTO).
+
+## TODO
+
+- **Wire up side-IR obstacle avoidance.** The left/right binary IR sensors
+  (GPIO 12/16) are read into `obs_left` / `obs_right` and published on
+  `/ir/left` `/ir/right`, but no behavior currently uses them — the
+  avoidance logic was dropped when APPROACHING was rewritten to discrete
+  pulses. Today the robot only *appears* to avoid obstacles: the visual
+  servo steers toward the target bbox and the path curves past obstacles
+  incidentally. An obstacle that directly blocks the path or hides the
+  target can stall or collide the robot. Add active avoidance in the
+  SEARCH/APPROACHING tick: on a side-IR hit, steer away before the next
+  forward pulse. Params `side_ir_enabled` and `avoid_yaw_bias` already exist.
