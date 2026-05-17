@@ -5,6 +5,7 @@ parse(text) returns one of:
   {'action': 'stop'}
   {'action': 'photo'}
   {'action': 'rotate_photo'}
+  {'action': 'map'}                               # request the semantic map
   {'action': 'find', 'target': '<coco_class>'}   # target None if unrecognised
   None  -- unparseable
 
@@ -147,6 +148,9 @@ def parse(text):
     # rotate_photo MUST be checked before photo ('旋转拍照' contains '拍照')
     if any(k in t for k in ('旋转拍照', '环拍', '转一圈拍照', '转圈拍照')):
         return {'action': 'rotate_photo'}
+
+    if any(k in t for k in ('地图', '语义地图', 'map')):
+        return {'action': 'map'}
 
     if any(k in t for k in ('停', 'stop')):
         return {'action': 'stop'}

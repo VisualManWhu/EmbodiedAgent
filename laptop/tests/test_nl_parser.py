@@ -50,6 +50,12 @@ def test_find_unknown_target():
     assert parse('去找独角兽') == {'action': 'find', 'target': None}
 
 
+def test_map():
+    assert parse('地图') == {'action': 'map'}
+    assert parse('给我看语义地图') == {'action': 'map'}
+    assert parse('map') == {'action': 'map'}
+
+
 def test_unparseable():
     assert parse('帮我把灯关了') is None
     assert parse('') is None

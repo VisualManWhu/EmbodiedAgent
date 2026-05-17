@@ -1,0 +1,14 @@
+# OV5647 (Pi Camera v1) intrinsics at the run resolution.
+#
+# PLACEHOLDER — derived from the nominal ~53.5 deg horizontal FOV, NOT measured.
+# Pose accuracy depends on this. Calibrate before relying on the map:
+#   python -m slam.camera_calib calibrate --images calib_shots
+# which overwrites this file and sets `calibrated: true`.
+image_width: 640
+image_height: 480
+camera_matrix:
+  - [635.0, 0.0, 320.0]
+  - [0.0, 635.0, 240.0]
+  - [0.0, 0.0, 1.0]
+distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
+calibrated: false
