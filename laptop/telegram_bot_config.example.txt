@@ -1,0 +1,12 @@
+# Telegram bot config — TEMPLATE.
+# Copy this file to telegram_bot_config.txt and fill in your real values.
+# telegram_bot_config.txt is gitignored; never commit real secrets.
+
+# Bot token from @BotFather
+BOT_TOKEN=PUT-YOUR-BOTFATHER-TOKEN-HERE
+
+# Raspberry Pi IP address
+PI_IP=192.168.178.12
+
+# Your Telegram numeric user id(s). Comma-separated for multiple.
+AUTHORIZED_IDS=123456789

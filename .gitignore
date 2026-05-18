@@ -21,3 +21,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 laptop/telegram_bot_config.txt
+
+# Claude Code worktrees / local state
+.claude/

@@ -10,6 +10,7 @@ Config: set BOT_TOKEN, PI_IP, AUTHORIZED_IDS below.
 Run:    python telegram_bot.py
 """
 import io
+import os
 import threading
 import time
 
@@ -19,11 +20,36 @@ from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filte
 
 from nl_parser import parse, SUPPORTED_TARGETS_CN
 
-# ---- config ----
-BOT_TOKEN = ''
-PI_IP = ''
-AUTHORIZED_IDS = {}        # your Telegram numeric user id(s)
-# ----------------
+
+def _load_config():
+    """Load secrets from telegram_bot_config.txt (gitignored — never committed).
+
+    Copy telegram_bot_config.example.txt to telegram_bot_config.txt and fill in
+    BOT_TOKEN / PI_IP / AUTHORIZED_IDS. Keeping the real token out of the
+    tracked source prevents it leaking on the public repo.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        'telegram_bot_config.txt')
+    if not os.path.exists(path):
+        raise SystemExit(
+            f'config not found: {path}\n'
+            'Copy telegram_bot_config.example.txt to telegram_bot_config.txt '
+            'and fill in BOT_TOKEN / PI_IP / AUTHORIZED_IDS.')
+    cfg = {}
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            cfg[k.strip()] = v.strip()
+    return cfg
+
+
+_cfg = _load_config()
+BOT_TOKEN = _cfg['BOT_TOKEN']
+PI_IP = _cfg['PI_IP']
+AUTHORIZED_IDS = {int(x) for x in _cfg.get('AUTHORIZED_IDS', '').split(',') if x.strip()}
 
 CMD_URL = f'http://{PI_IP}:9091/command'
 STATUS_URL = f'http://{PI_IP}:9091/status'

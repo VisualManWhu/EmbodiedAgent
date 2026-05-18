@@ -17,7 +17,7 @@ Setup (Windows PowerShell):
     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 Run:
-    python laptop_detector.py --pi 192.168.178.37
+    python laptop_detector.py --pi 192.168.178.12
 
 Stop: press q in the preview window, or Ctrl+C.
 """
