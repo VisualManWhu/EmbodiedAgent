@@ -89,7 +89,7 @@ class SlamRunner:
 
     def __init__(self, pi_ip, semantic_port, map_port, tag_map_path,
                  intrinsics_path, map_json_path, cam_height_m,
-                 fusion_overrides=None):
+                 fusion_overrides=None, nav_overrides=None):
         from slam import camera_calib
         from slam.apriltag_detector import AprilTagDetector
         from slam.pose_estimator import PoseEstimator, load_tag_map
@@ -126,15 +126,37 @@ class SlamRunner:
             for i, e in self.tag_map.items()]
 
         from slam.dead_reckoner import DeadReckoner
-        from slam.nav_session import NavConfig
+        from slam.nav_session import NavConfig, NavSession   # noqa: F401
 
-        dr_time = (fusion_overrides.get('dr_time_limit_sec', 5.0)
-                   if fusion_overrides else 5.0)
-        dr_dist = (fusion_overrides.get('dr_distance_limit_m', 0.5)
-                   if fusion_overrides else 0.5)
+        nav_overrides = nav_overrides or {}
+        # dead-reckoner caps double as the "no-tag grace" window for the
+        # NavSession scan trigger — pose_stale fires once either cap trips.
+        dr_time = (nav_overrides.get('dr_time_limit_sec')
+                   or nav_overrides.get('no_tag_grace_sec') or 5.0)
+        dr_dist = nav_overrides.get('dr_distance_limit_m') or 0.5
         self.dead_reckoner = DeadReckoner(time_limit_sec=dr_time,
                                           distance_limit_m=dr_dist)
         self.nav_config = NavConfig()
+        nav_field_map = {
+            'arrived_radius_m': 'arrived_radius_m',
+            'v_max': 'nav_v_max',
+            'w_max': 'nav_w_max',
+            'max_pulse_sec': 'max_pulse_sec',
+            'block_retries': 'block_retries',
+            'scan_max_rotations': 'scan_max_rotations',
+        }
+        for cfg_field, override_key in nav_field_map.items():
+            val = nav_overrides.get(override_key)
+            if val is not None:
+                setattr(self.nav_config, cfg_field, val)
+        print(f'nav: arrived={self.nav_config.arrived_radius_m}m  '
+              f'v={self.nav_config.v_max}m/s  w={self.nav_config.w_max}rad/s  '
+              f'pulse<={self.nav_config.max_pulse_sec}s  '
+              f'dr<={dr_time}s/{dr_dist}m  '
+              f'block_retries={self.nav_config.block_retries}  '
+              f'scan_rot<={self.nav_config.scan_max_rotations}')
+        # used by Task 7 nav api when filtering class candidates.
+        self.landmark_conf_min = nav_overrides.get('landmark_conf_min', 0.7)
         self.session_nav = None                     # NavSession | None
         self.event_url = f'http://{pi_ip}:9091/status'
         self.cmd_url = f'http://{pi_ip}:9091/command'
@@ -148,7 +170,11 @@ class SlamRunner:
               f'http://0.0.0.0:{map_port}/map.png')
 
     def process(self, frame, detections, pan_rad, tilt_rad, now):
-        """Fuse one frame. Returns ``(n_tags_seen, located)``."""
+        """Fuse one frame and tick any active goto.
+
+        Returns ``(n_tags_seen, located, nav_status)`` where ``nav_status`` is
+        the NavSession state string (or None if no goto is active).
+        """
         tag_dets = self.tag_detector.detect(frame)
         pose = self.pose_est.estimate(tag_dets, pan_rad, tilt_rad)
         located = pose is not None
@@ -224,6 +250,8 @@ class SlamRunner:
 
     def start_goto(self, goal_xy, goal_id, goal_label):
         from slam.nav_session import NavSession
+        # NavSession imported lazily so SlamRunner can be constructed without
+        # the slam package; only used when --slam, which already imported it.
         self.session_nav = NavSession(goal_xy=goal_xy, goal_id=goal_id,
                                       goal_label=goal_label,
                                       config=self.nav_config)
@@ -358,10 +386,22 @@ def main():
             'miss_demote': args.miss_demote,
             'miss_prune': args.miss_prune,
         }
+        nav_overrides = {
+            'arrived_radius_m': args.arrived_radius_m,
+            'nav_v_max': args.nav_v_max,
+            'nav_w_max': args.nav_w_max,
+            'max_pulse_sec': args.max_pulse_sec,
+            'no_tag_grace_sec': args.no_tag_grace_sec,
+            'dr_distance_limit_m': args.dr_distance_limit_m,
+            'dr_time_limit_sec': args.dr_time_limit_sec,
+            'block_retries': args.block_retries,
+            'scan_max_rotations': args.scan_max_rotations,
+            'landmark_conf_min': args.landmark_conf_min,
+        }
         try:
             slam = SlamRunner(args.pi, args.semantic_port, args.map_port,
                               args.tag_map, args.intrinsics, args.map_json,
-                              args.cam_height, fusion_overrides)
+                              args.cam_height, fusion_overrides, nav_overrides)
         except (ImportError, FileNotFoundError, KeyError) as e:
             print(f'semantic SLAM disabled: {e}')
             slam = None
