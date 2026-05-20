@@ -71,6 +71,36 @@ def test_move_duration_capped():
     assert parse('前进0秒')['seconds'] == 0.2
 
 
+def test_goto_by_id():
+    assert parse('去 id 3') == {'action': 'goto', 'landmark_id': 3}
+    assert parse('goto id 7') == {'action': 'goto', 'landmark_id': 7}
+
+
+def test_goto_origin():
+    assert parse('回原点') == {'action': 'goto', 'origin': True}
+    assert parse('回到原点') == {'action': 'goto', 'origin': True}
+
+
+def test_goto_class():
+    assert parse('去椅子') == {'action': 'goto', 'target_class': 'chair'}
+    assert parse('goto chair') == {'action': 'goto', 'target_class': 'chair'}
+
+
+def test_patrol():
+    assert parse('巡逻') == {'action': 'patrol'}
+
+
+def test_room_tour():
+    assert parse('绕室') == {'action': 'room_tour'}
+    assert parse('绕室一周') == {'action': 'room_tour'}
+
+
+def test_chain_search_still_routes_to_find():
+    # 'find <class>' / '去找<class>' continue to mean SEARCH; chain logic is
+    # in telegram_bot.py, not here.
+    assert parse('去找椅子') == {'action': 'find', 'target': 'chair'}
+
+
 def test_unparseable():
     assert parse('帮我把灯关了') is None
     assert parse('') is None
