@@ -39,7 +39,8 @@ MAP_URL = 'http://127.0.0.1:8091/map.png'
 NAV_API = 'http://127.0.0.1:8092'
 
 HELP = ('支持指令：前进/后退/左移/右移/左转/右转/停/拍照/旋转拍照/地图/'
-        '去找<目标>。可加时长：前进3秒、后退2秒(最长30秒)。'
+        '去找<目标>/去<目标>/去 id N/回原点/巡逻/绕室。'
+        '可加时长：前进3秒、后退2秒(最长30秒)。'
         '目标：' + SUPPORTED_TARGETS_CN)
 
 PHOTO_LABELS = {1: '前', 2: '右', 3: '后', 4: '左'}
@@ -158,6 +159,10 @@ def _poll_nav(loop, context, chat_id, stop_after_sec=300):
                 context.bot.send_message(chat_id,
                     f'导航失败 ({reason or state})'), loop)
         return
+    # loop exited without a nav_done event — tell the user, don't fail silently
+    asyncio.run_coroutine_threadsafe(
+        context.bot.send_message(chat_id,
+            f'导航超时 ({stop_after_sec:.0f}s 无结果)'), loop)
 
 
 def _run_patrol(loop, context, chat_id):

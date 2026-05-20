@@ -123,7 +123,6 @@ class SlamRunner:
         self.nav_api_port = map_port + 1            # default 8092
         self._nav_done_lock = threading.Lock()
         self._nav_done_event = None
-        self._start_nav_api()
         self.post_url = f'http://{pi_ip}:{semantic_port}/map'
         self.tags_payload = [
             {'id': i, 'x': e['x'], 'y': e['y'], 'z': e.get('z', 0.0)}
@@ -170,6 +169,9 @@ class SlamRunner:
         self._last_post = 0.0
         self._last_save = 0.0
         self._post_ok = None
+        # start the nav api LAST so its handler threads can never see partly
+        # initialized state (landmark_conf_min, last_robot, session_nav, etc.)
+        self._start_nav_api()
         print(f'semantic SLAM: {len(self.tag_map)} tags, map served at '
               f'http://0.0.0.0:{map_port}/map.png')
 
@@ -289,12 +291,17 @@ class SlamRunner:
 
     def _handle_candidates(self, h):
         import json as _json
+        import types as _types
         from slam.landmark_selector import by_class
         n = int(h.headers.get('Content-Length', 0))
         body = _json.loads(h.rfile.read(n))
         cls = body['target_class']
         robot = self.last_robot or (0.0, 0.0, 0.0)
-        cands = by_class(self.smap, cls, (robot[0], robot[1]),
+        # snapshot the landmarks dict on the server thread (atomic in CPython)
+        # so the main thread is free to mutate self.smap.landmarks during
+        # `process()` without tripping the iteration in by_class.
+        smap_view = _types.SimpleNamespace(landmarks=dict(self.smap.landmarks))
+        cands = by_class(smap_view, cls, (robot[0], robot[1]),
                          conf_min=self.landmark_conf_min)
         out = [{'id': lm.id, 'label': lm.label,
                 'x': float(lm.position[0]), 'y': float(lm.position[1]),
