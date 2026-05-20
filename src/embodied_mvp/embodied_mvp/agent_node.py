@@ -259,7 +259,10 @@ class AgentNode(Node):
         elif action == 'move':
             self.mode = 'MANUAL'
             self.manual_twist = self._dir_to_twist(cmd.get('dir'))
-            self.manual_deadline = now + self.manual_step_sec
+            # optional 'seconds' lets the operator say "前进 3 秒" for mapping;
+            # capped here as a safety stop matching the parser's MAX_DURATION.
+            sec = float(cmd.get('seconds') or self.manual_step_sec)
+            self.manual_deadline = now + max(0.1, min(30.0, sec))
         elif action == 'find':
             target = cmd.get('target')
             if target:

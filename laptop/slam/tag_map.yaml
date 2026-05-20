@@ -1,0 +1,35 @@
+# AprilTag layout TEMPLATE — example geometry only. Real measurements go in
+# `tag_map.local.yaml` (gitignored) so room layout never reaches the repo.
+# load_tag_map() prefers tag_map.local.yaml if present, falling back to this.
+#
+# Map frame: x-y on the floor, z up. Tag 0 IS the origin by convention.
+# Per tag:
+#   x, y, z   tag-centre position in metres
+#   yaw_deg   compass direction the tag FACE points, in the x-y plane
+#             (0 = +x, 90 = +y). A tag on a wall faces into the room.
+#   size_m    side length of the black tag square, in metres
+tags:
+  0:
+    x: 0.0
+    y: 0.0
+    z: 0.50
+    yaw_deg: 0.0
+    size_m: 0.16
+  1:
+    x: 2.40
+    y: 0.0
+    z: 0.50
+    yaw_deg: 90.0
+    size_m: 0.16
+  2:
+    x: 2.40
+    y: 3.10
+    z: 0.50
+    yaw_deg: 180.0
+    size_m: 0.16
+  3:
+    x: 0.0
+    y: 3.10
+    z: 0.50
+    yaw_deg: 270.0
+    size_m: 0.16

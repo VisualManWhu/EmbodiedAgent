@@ -6,11 +6,12 @@ and rotate-photo events back to the phone.
 
 Setup:
     pip install python-telegram-bot requests
-Config: set BOT_TOKEN, PI_IP, AUTHORIZED_IDS below.
+    cp laptop/telegram_bot_config.example.txt laptop/telegram_bot_config.txt
+    # edit telegram_bot_config.txt — BOT_TOKEN, PI_IP, AUTHORIZED_IDS
 Run:    python telegram_bot.py
 """
 import io
-import os
+import sys
 import threading
 import time
 
@@ -19,46 +20,25 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
 from nl_parser import parse, SUPPORTED_TARGETS_CN
+from secrets_loader import load_bot_secrets
 
-
-def _load_config():
-    """Load secrets from telegram_bot_config.txt (gitignored — never committed).
-
-    Copy telegram_bot_config.example.txt to telegram_bot_config.txt and fill in
-    BOT_TOKEN / PI_IP / AUTHORIZED_IDS. Keeping the real token out of the
-    tracked source prevents it leaking on the public repo.
-    """
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        'telegram_bot_config.txt')
-    if not os.path.exists(path):
-        raise SystemExit(
-            f'config not found: {path}\n'
-            'Copy telegram_bot_config.example.txt to telegram_bot_config.txt '
-            'and fill in BOT_TOKEN / PI_IP / AUTHORIZED_IDS.')
-    cfg = {}
-    with open(path, encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#') or '=' not in line:
-                continue
-            k, v = line.split('=', 1)
-            cfg[k.strip()] = v.strip()
-    return cfg
-
-
-_cfg = _load_config()
-BOT_TOKEN = _cfg['BOT_TOKEN']
-PI_IP = _cfg['PI_IP']
-AUTHORIZED_IDS = {int(x) for x in _cfg.get('AUTHORIZED_IDS', '').split(',') if x.strip()}
+try:
+    BOT_TOKEN, PI_IP, AUTHORIZED_IDS = load_bot_secrets()
+except (FileNotFoundError, ValueError) as _e:
+    print(f'config error: {_e}', file=sys.stderr)
+    sys.exit(1)
 
 CMD_URL = f'http://{PI_IP}:9091/command'
 STATUS_URL = f'http://{PI_IP}:9091/status'
 SNAPSHOT_URL = f'http://{PI_IP}:8080/snapshot'
 # laptop_detector serves detection-boxed frames here (same laptop as the bot)
 DETECTOR_URL = 'http://127.0.0.1:8090/annotated'
+# laptop_detector --slam serves the top-down semantic map here
+MAP_URL = 'http://127.0.0.1:8091/map.png'
 
-HELP = ('支持指令：前进/后退/左移/右移/左转/右转/停/拍照/旋转拍照/'
-        '去找<目标>。目标：' + SUPPORTED_TARGETS_CN)
+HELP = ('支持指令：前进/后退/左移/右移/左转/右转/停/拍照/旋转拍照/地图/'
+        '去找<目标>。可加时长：前进3秒、后退2秒(最长30秒)。'
+        '目标：' + SUPPORTED_TARGETS_CN)
 
 PHOTO_LABELS = {1: '前', 2: '右', 3: '后', 4: '左'}
 
@@ -85,6 +65,18 @@ def fetch_photo():
                 return r.content
         except requests.RequestException:
             pass
+    return None
+
+
+def fetch_map():
+    """Return PNG bytes of the top-down semantic map, or None if the SLAM
+    mapper (laptop_detector --slam) is not running."""
+    try:
+        r = _session.get(MAP_URL, timeout=3.0)
+        if r.status_code == 200:
+            return r.content
+    except requests.RequestException:
+        pass
     return None
 
 
@@ -147,6 +139,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if cmd['action'] == 'photo':
         await _send_photo(context, chat_id, '当前画面')
+        return
+
+    if cmd['action'] == 'map':
+        png = fetch_map()
+        if png is None:
+            await context.bot.send_message(
+                chat_id, '语义地图未就绪（需 laptop_detector --slam 运行）')
+        else:
+            await context.bot.send_photo(chat_id, photo=io.BytesIO(png),
+                                         caption='语义地图')
         return
 
     if cmd['action'] == 'find' and cmd['target'] is None:
