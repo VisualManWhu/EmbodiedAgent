@@ -58,18 +58,25 @@ class NavSession:
     _scan_start_t: float | None = None
 
     def on_tag_fix(self, t: float):
-        """Record that a tag-fix arrived at time ``t``."""
+        """Record that a tag-fix arrived at time ``t``.
+
+        Always clear scan tracking — a fresh tag fix ends any in-progress
+        recovery sweep regardless of the current state, so the next stale
+        period starts from a clean counter.
+        """
         self.last_tag_t = float(t)
+        self.scan_count = 0
+        self._scan_start_t = None
         if self.state is State.SCANNING:
-            # interrupted scan, resume normal driving next tick
             self.state = State.DRIVING
-            self.scan_count = 0
-            self._scan_start_t = None
 
     def on_pi_event(self, event: str):
         if event == 'pulse_done':
             if self.state is State.WAITING_PULSE:
                 self.state = State.DRIVING
+            elif self.state is State.SCANNING:
+                # stay in SCANNING; next tick decides scan-again vs resume
+                pass
             # Reset block count only on a clean pulse (no queued avoidance)
             if not self.queued:
                 self.block_count = 0
@@ -135,14 +142,14 @@ class NavSession:
         return NavCommand(self.config.v_max, 0.0, 0.0, sec, 'forward')
 
     def _scan_tick(self, now: float):
-        if self._scan_start_t is None:
-            self._scan_start_t = now
         if self.scan_count >= self.config.scan_max_rotations:
             self.state = State.FAILED
             self.fail_reason = 'lost'
             return None
+        if self._scan_start_t is None:
+            self._scan_start_t = now
         self.scan_count += 1
-        self.state = State.WAITING_PULSE
+        self.state = State.SCANNING
         sec = self.config.scan_rotate_rad / self.config.w_max
         return NavCommand(0.0, 0.0, self.config.w_max, sec, 'scan_rotate')
 

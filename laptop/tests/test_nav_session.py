@@ -111,3 +111,26 @@ def test_tag_fix_during_scan_resumes_drive():
     s.on_tag_fix(t=11.0)                                         # recovered
     cmd = s.tick((0.1, 0.0, 0.0), 11.5, pose_stale=False)
     assert cmd.kind in ('rotate', 'forward')
+
+
+def test_scan_count_clears_after_tag_recovery():
+    """After scan recovers via on_tag_fix, a later stale period must restart
+    scanning from scan_count=0, not from where the previous scan left off."""
+    s = _sess(scan_max_rotations=3)
+    s.on_tag_fix(t=0.0)
+    # first lost period: 2 scan pulses then tag found
+    s.tick((0.0, 0.0, 0.0), 10.0, pose_stale=True)
+    s.on_pi_event('pulse_done')
+    s.tick((0.0, 0.0, 0.0), 11.0, pose_stale=True)
+    s.on_pi_event('pulse_done')
+    assert s.scan_count == 2
+    s.on_tag_fix(t=12.0)
+    assert s.scan_count == 0
+    # second lost period: should get its full budget of 3 pulses again
+    for i in range(3):
+        s.tick((0.0, 0.0, 0.0), 20.0 + i, pose_stale=True)
+        s.on_pi_event('pulse_done')
+    # 4th tick exhausts -> FAILED('lost')
+    s.tick((0.0, 0.0, 0.0), 25.0, pose_stale=True)
+    assert s.state is State.FAILED
+    assert s.fail_reason == 'lost'
