@@ -125,7 +125,20 @@ class SlamRunner:
             {'id': i, 'x': e['x'], 'y': e['y'], 'z': e.get('z', 0.0)}
             for i, e in self.tag_map.items()]
 
-        self.session = requests.Session()
+        from slam.dead_reckoner import DeadReckoner
+        from slam.nav_session import NavConfig
+
+        dr_time = (fusion_overrides.get('dr_time_limit_sec', 5.0)
+                   if fusion_overrides else 5.0)
+        dr_dist = (fusion_overrides.get('dr_distance_limit_m', 0.5)
+                   if fusion_overrides else 0.5)
+        self.dead_reckoner = DeadReckoner(time_limit_sec=dr_time,
+                                          distance_limit_m=dr_dist)
+        self.nav_config = NavConfig()
+        self.session_nav = None                     # NavSession | None
+        self.event_url = f'http://{pi_ip}:9091/status'
+        self.cmd_url = f'http://{pi_ip}:9091/command'
+        self.http = requests.Session()
         self.last_robot = None
         self._last_render = 0.0
         self._last_post = 0.0
@@ -159,7 +172,24 @@ class SlamRunner:
         if now - self._last_save >= self.SAVE_INTERVAL:
             self.save()
             self._last_save = now
-        return len(tag_dets), located
+
+        # --- nav update --------------------------------------------------
+        nav_status = None
+        if self.session_nav is not None:
+            if located:
+                rx, ry, ryaw = pose['base_xytheta']
+                self.dead_reckoner.reset((rx, ry, ryaw), now)
+                self.session_nav.on_tag_fix(now)
+                robot_pose, pose_stale = (rx, ry, ryaw), False
+            else:
+                robot_pose, pose_stale = self.dead_reckoner.pose_at(now)
+            cmd = self.session_nav.tick(robot_pose, now, pose_stale=pose_stale)
+            if cmd is not None and cmd.kind != 'stop':
+                self._send_nav(cmd, now)
+            self._drain_pi_events()
+            if self.session_nav is not None:
+                nav_status = self.session_nav.state.value
+        return len(tag_dets), located, nav_status
 
     def _render(self):
         robot = self.last_robot
@@ -175,7 +205,7 @@ class SlamRunner:
         payload = {'robot': robot, 'tags': self.tags_payload,
                    'landmarks': self.smap.snapshot()}
         try:
-            self.session.post(self.post_url, json=payload, timeout=0.5)
+            self.http.post(self.post_url, json=payload, timeout=0.5)
             if self._post_ok is not True:
                 print('semantic map POST to Pi: OK')
                 self._post_ok = True
@@ -189,6 +219,68 @@ class SlamRunner:
             self.smap.save(self.map_json_path)
         except OSError as e:
             print(f'warning: could not save semantic map: {e}')
+
+    # ---- navigation lifecycle ------------------------------------------
+
+    def start_goto(self, goal_xy, goal_id, goal_label):
+        from slam.nav_session import NavSession
+        self.session_nav = NavSession(goal_xy=goal_xy, goal_id=goal_id,
+                                      goal_label=goal_label,
+                                      config=self.nav_config)
+        print(f'NAV start -> {goal_label} id={goal_id} at {goal_xy}')
+
+    def stop_goto(self):
+        if self.session_nav is not None:
+            print('NAV stop')
+            try:
+                self.http.post(self.cmd_url, json={'action': 'nav_stop'},
+                               timeout=0.5)
+            except Exception:                       # noqa: BLE001
+                pass
+            self.session_nav = None
+
+    def _send_nav(self, cmd, now):
+        payload = {'action': 'nav_pulse',
+                   'vx': cmd.vx, 'vy': cmd.vy, 'wz': cmd.wz,
+                   'seconds': cmd.seconds}
+        try:
+            self.http.post(self.cmd_url, json=payload, timeout=0.5)
+        except Exception:                           # noqa: BLE001
+            return
+        self.dead_reckoner.record_pulse(cmd.vx, cmd.vy, cmd.wz,
+                                        cmd.seconds, now)
+
+    def _drain_pi_events(self):
+        if self.session_nav is None:
+            return
+        try:
+            r = self.http.get(self.event_url, timeout=0.5)
+            if r.status_code != 200:
+                return
+            event = r.json().get('event') or ''
+        except Exception:                           # noqa: BLE001
+            return
+        if event:
+            self.session_nav.on_pi_event(event)
+            if self.session_nav.state.value in ('ARRIVED', 'FAILED'):
+                self._publish_nav_done()
+
+    def _publish_nav_done(self):
+        reason = (self.session_nav.fail_reason
+                  if self.session_nav.state.value == 'FAILED' else None)
+        result = {'event': 'nav_done',
+                  'state': self.session_nav.state.value,
+                  'goal_label': self.session_nav.goal_label,
+                  'goal_id': self.session_nav.goal_id,
+                  'reason': reason}
+        print(f'NAV result: {result}')
+        if self.session_nav.state.value == 'FAILED':
+            try:
+                self.http.post(self.cmd_url,
+                               json={'action': 'nav_stop'}, timeout=0.5)
+            except Exception:
+                pass
+        self.session_nav = None
 
 
 def main():
@@ -233,6 +325,17 @@ def main():
                     help='in-FOV misses that demote a CONFIRMED landmark')
     ap.add_argument('--miss-prune', type=int, default=None,
                     help='in-FOV misses that prune any landmark')
+    # navigation
+    ap.add_argument('--arrived-radius-m', type=float, default=0.4)
+    ap.add_argument('--nav-v-max', type=float, default=0.15)
+    ap.add_argument('--nav-w-max', type=float, default=0.4)
+    ap.add_argument('--max-pulse-sec', type=float, default=1.5)
+    ap.add_argument('--no-tag-grace-sec', type=float, default=5.0)
+    ap.add_argument('--dr-distance-limit-m', type=float, default=0.5)
+    ap.add_argument('--dr-time-limit-sec', type=float, default=5.0)
+    ap.add_argument('--block-retries', type=int, default=3)
+    ap.add_argument('--scan-max-rotations', type=int, default=4)
+    ap.add_argument('--landmark-conf-min', type=float, default=0.7)
     args = ap.parse_args()
 
     snapshot_url = f'http://{args.pi}:{args.stream_port}/snapshot'
@@ -343,10 +446,11 @@ def main():
             slam_info = ''
             if slam is not None:
                 try:
-                    n_tags, located = slam.process(frame, dets, pan_yaw,
-                                                   pan_tilt, time.time())
+                    n_tags, located, nav_state = slam.process(
+                        frame, dets, pan_yaw, pan_tilt, time.time())
                     slam_info = (f'  tags={n_tags} '
-                                 f'{"LOCATED" if located else "no-fix"}')
+                                 f'{"LOCATED" if located else "no-fix"}'
+                                 f'  nav={nav_state or "-"}')
                 except Exception as e:  # noqa: BLE001 - never kill detection
                     slam_info = f'  slam-error: {e}'
 
