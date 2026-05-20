@@ -181,6 +181,9 @@ async def _send_photo(context, chat_id, caption):
     await context.bot.send_photo(chat_id, photo=io.BytesIO(jpg), caption=caption)
 
 
+SEARCH_TIMEOUT_SEC = 30.0
+
+
 def _poll_events(loop, context, chat_id, stop_after_sec=120):
     """Background thread: poll Pi status, relay arrival / rotate-photo events."""
     import asyncio
@@ -209,6 +212,43 @@ def _poll_events(loop, context, chat_id, stop_after_sec=120):
             asyncio.run_coroutine_threadsafe(
                 context.bot.send_message(chat_id, '旋转拍照完成'), loop)
             return
+
+
+def _run_chain(loop, context, chat_id, target):
+    """SEARCH first; on timeout fall back to NAV via the nav api."""
+    import asyncio
+    deadline = time.time() + SEARCH_TIMEOUT_SEC
+    arrived = False
+    while time.time() < deadline:
+        time.sleep(0.7)
+        st = get_status()
+        if st is None:
+            continue
+        ev = st.get('event', '')
+        if ev.startswith('arrived:'):
+            arrived = True
+            target_name = ev.split(':', 1)[1]
+            asyncio.run_coroutine_threadsafe(
+                context.bot.send_message(chat_id, f'已到达 {target_name}'), loop)
+            asyncio.run_coroutine_threadsafe(
+                _send_photo(context, chat_id, f'到达 {target_name}'), loop)
+            return
+    if arrived:
+        return
+    asyncio.run_coroutine_threadsafe(
+        context.bot.send_message(chat_id,
+            f'{SEARCH_TIMEOUT_SEC:.0f}s 未发现 {target}, 改用地图导航'), loop)
+    cands = fetch_candidates(target)
+    if not cands:
+        asyncio.run_coroutine_threadsafe(
+            context.bot.send_message(chat_id,
+                f'地图中也没有 {target} — 放弃'), loop)
+        return
+    start_goto_id(cands[0]['id'])
+    asyncio.run_coroutine_threadsafe(
+        context.bot.send_message(chat_id,
+            f"前往 {target} id {cands[0]['id']} ..."), loop)
+    _poll_nav(loop, context, chat_id)
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -309,7 +349,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cmd['action'] == 'find':
         await context.bot.send_message(chat_id, f"前往寻找 {cmd['target']} ...")
         loop = __import__('asyncio').get_running_loop()
-        threading.Thread(target=_poll_events, args=(loop, context, chat_id),
+        threading.Thread(target=_run_chain,
+                         args=(loop, context, chat_id, cmd['target']),
                          daemon=True).start()
     elif cmd['action'] == 'rotate_photo':
         await context.bot.send_message(chat_id, '开始旋转拍照 ...')
