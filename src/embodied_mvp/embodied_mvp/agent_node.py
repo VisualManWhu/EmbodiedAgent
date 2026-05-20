@@ -169,6 +169,9 @@ class AgentNode(Node):
         self.rp_phase = 'dwell'
         self.rp_phase_start = 0.0
         self.rp_photo_posted = False
+        self.nav_twist = (0.0, 0.0, 0.0)
+        self.nav_deadline = 0.0
+        self.nav_blocked = False
         self.cmd_server = CommandServer(self.get_parameter('command_port').value)
         self.get_logger().info(
             f"agent_node command server on :{self.get_parameter('command_port').value}")
@@ -269,6 +272,19 @@ class AgentNode(Node):
                 self.target_class = target
                 self.reset_search(now)
                 self.mode = 'SEARCH'
+        elif action == 'nav_pulse':
+            self.mode = 'NAV'
+            vx = float(cmd.get('vx', 0.0))
+            vy = float(cmd.get('vy', 0.0))
+            wz = float(cmd.get('wz', 0.0))
+            sec = float(cmd.get('seconds', 0.5))
+            self.nav_twist = (vx, vy, wz)
+            self.nav_deadline = now + max(0.05, min(2.0, sec))
+            self.nav_blocked = False
+        elif action == 'nav_stop':
+            self.mode = 'IDLE'
+            self.nav_twist = (0.0, 0.0, 0.0)
+            self.nav_deadline = 0.0
         elif action == 'rotate_photo':
             self.mode = 'ROTATE_PHOTO'
             self.rp_index = 0
@@ -454,6 +470,38 @@ class AgentNode(Node):
                     self.rp_phase_start = now
                     self.rp_photo_posted = False
 
+    def tick_nav(self, now):
+        """Execute a single NAV pulse. Abort on ultrasonic / side IR; report
+        events back to the laptop via the command_server status channel.
+        """
+        if now >= self.nav_deadline:
+            self.publish_full_cmd(0.0, 0.0, 0.0)
+            if not self.nav_blocked:
+                self.cmd_server.post_event('pulse_done')
+            self.mode = 'IDLE'
+            return
+        # obstacle checks — abort the pulse, post a typed event
+        if self.ir_range < self.stop_d:
+            self.publish_full_cmd(0.0, 0.0, 0.0)
+            self.cmd_server.post_event('blocked:front')
+            self.nav_blocked = True
+            self.mode = 'IDLE'
+            return
+        if self.side_ir_enabled and self.obs_left:
+            self.publish_full_cmd(0.0, 0.0, 0.0)
+            self.cmd_server.post_event('blocked:left')
+            self.nav_blocked = True
+            self.mode = 'IDLE'
+            return
+        if self.side_ir_enabled and self.obs_right:
+            self.publish_full_cmd(0.0, 0.0, 0.0)
+            self.cmd_server.post_event('blocked:right')
+            self.nav_blocked = True
+            self.mode = 'IDLE'
+            return
+        vx, vy, wz = self.nav_twist
+        self.publish_full_cmd(vx, vy, wz)
+
     def tick(self):
         now = time.time()
         cmd = self.cmd_server.take_command()
@@ -467,6 +515,8 @@ class AgentNode(Node):
             self.tick_manual(now)
         elif self.mode == 'SEARCH':
             self.tick_search()
+        elif self.mode == 'NAV':
+            self.tick_nav(now)
         elif self.mode == 'ROTATE_PHOTO':
             self.tick_rotate_photo(now)
 
