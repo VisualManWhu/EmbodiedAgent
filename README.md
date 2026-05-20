@@ -150,6 +150,26 @@ python laptop_detector.py --pi 172.20.10.4 --slam `
 zero — measure it; the default 0.15 matches this kit. Ground-plane object
 placement is sensitive to this value.
 
+### Add navigation (semantic-nav P2.1)
+
+With SLAM enabled, navigation commands work over Telegram:
+
+- `去 id 3` — drive to a specific landmark id.
+- `回原点` — drive to tag 0.
+- `去椅子` — drive to the nearest confirmed `chair`; if multiple, the bot
+  asks via inline buttons.
+- `去找椅子` — try visual SEARCH first; on timeout fall back to NAV using
+  any confirmed `chair` on the map.
+- `巡逻` — visit every confirmed landmark, photo at each.
+- `绕室` — visit every AprilTag by id.
+- `停` — aborts the active goto.
+
+Tunable from `laptop_detector.py`: `--arrived-radius-m`, `--nav-v-max`,
+`--nav-w-max`, `--max-pulse-sec`, `--no-tag-grace-sec`,
+`--dr-distance-limit-m`, `--dr-time-limit-sec`, `--block-retries`,
+`--scan-max-rotations`, `--landmark-conf-min`. Defaults match
+[`docs/superpowers/specs/2026-05-17-semantic-nav-design.md`](docs/superpowers/specs/2026-05-17-semantic-nav-design.md).
+
 ### View the map
 
 - Browser: <http://127.0.0.1:8091/map.png> (laptop) — top-down PNG.
@@ -215,6 +235,7 @@ placement is sensitive to this value.
 | `http://<pi>:9092/map` | `semantic_map_node` | POST semantic map from laptop |
 | `http://<laptop>:8090/annotated` | `laptop_detector.py` | latest YOLO-boxed JPEG |
 | `http://<laptop>:8091/map.png` | `laptop_detector.py --slam` | top-down semantic map PNG |
+| `http://<laptop>:8092/nav/*` | `laptop_detector.py --slam` | nav api for telegram_bot (candidates, goto, done, landmarks, tags) |
 
 ## Hardware bring-up checklist
 
@@ -273,16 +294,9 @@ For mapping verification see the semantic-SLAM phase plan in
 
 ## TODO
 
-- **Wire up side-IR obstacle avoidance.** Left/right binary IR
-  (`/ir/left`, `/ir/right`) are read but no behavior consumes them — avoidance
-  logic was dropped when APPROACHING was rewritten to discrete pulses. The
-  robot only *appears* to avoid obstacles because the visual servo path
-  curves past them incidentally. Params `side_ir_enabled` and
-  `avoid_yaw_bias` already exist for the eventual re-implementation.
-- **Dead-reckoning between tag observations.** When no AprilTag is visible
-  the robot pose freezes (documented limitation — no encoders, no IMU).
-  Integrating commanded `/cmd_vel` would buy a few seconds of plausible
-  extrapolation; cheap to add but accuracy will degrade quickly.
+- **Side-IR is now consumed by NAV mode for blocked events** but is not
+  yet used in the SEARCH/APPROACHING discrete-pulse loop. Wiring it into
+  SEARCH would let the legacy reactive search also avoid obstacles too.
 - **Auto-built tag pose graph.** Today tag positions are hand-measured.
   Auto-solving the tag layout from co-visible observations would remove
   the manual measurement step at the cost of some drift.
