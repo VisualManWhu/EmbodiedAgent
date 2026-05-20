@@ -62,6 +62,26 @@ def test_blocked_queues_strafe_then_forward():
     assert cmd2.kind == 'forward'
 
 
+def test_blocked_strafes_away_per_side():
+    """+vy = strafe LEFT (matches agent_node._dir_to_twist); strafe must move
+    AWAY from the blocked side, never into it."""
+    # left blocked -> strafe right -> negative vy
+    s = _sess(strafe_speed=0.15)
+    s.tick((0.0, 0.0, 0.0), 0.0)
+    s.on_pi_event('blocked:left')
+    cmd = s.tick((0.0, 0.0, 0.0), 0.1)
+    assert cmd.kind == 'strafe'
+    assert cmd.vy < 0, f'blocked:left should strafe right (vy<0), got vy={cmd.vy}'
+
+    # right blocked -> strafe left -> positive vy
+    s = _sess(strafe_speed=0.15)
+    s.tick((0.0, 0.0, 0.0), 0.0)
+    s.on_pi_event('blocked:right')
+    cmd = s.tick((0.0, 0.0, 0.0), 0.1)
+    assert cmd.kind == 'strafe'
+    assert cmd.vy > 0, f'blocked:right should strafe left (vy>0), got vy={cmd.vy}'
+
+
 def test_three_blocks_fail():
     s = _sess(block_retries=3)
     for _ in range(3):

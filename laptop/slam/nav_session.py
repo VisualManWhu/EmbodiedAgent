@@ -89,8 +89,15 @@ class NavSession:
             self.state = State.FAILED
             self.fail_reason = 'blocked'
             return
-        vy = (-self.config.strafe_speed if side == 'right'
-              else self.config.strafe_speed)
+        # Robot frame convention: +vy = strafe LEFT, -vy = strafe RIGHT
+        # (matches agent_node._dir_to_twist: 'left' -> (0, +s, 0)).
+        # Strafe AWAY from the side that tripped the obstacle sensor.
+        if side == 'left':
+            vy = -self.config.strafe_speed
+        elif side == 'right':
+            vy = +self.config.strafe_speed
+        else:                                       # 'front' or unknown
+            vy = +self.config.strafe_speed         # default: try left
         self.queued.append(NavCommand(0.0, vy, 0.0,
                                       self.config.strafe_seconds, 'strafe'))
         self.queued.append(NavCommand(self.config.v_max, 0.0, 0.0,

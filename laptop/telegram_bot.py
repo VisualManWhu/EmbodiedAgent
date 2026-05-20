@@ -137,6 +137,14 @@ def poll_nav_done():
     return None
 
 
+def stop_nav():
+    """Tell the laptop to abort any active NavSession. Best effort."""
+    try:
+        _session.post(f'{NAV_API}/nav/stop', timeout=2.0)
+    except requests.RequestException:
+        pass
+
+
 def _poll_nav(loop, context, chat_id, stop_after_sec=300):
     import asyncio
     deadline = time.time() + stop_after_sec
@@ -399,6 +407,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cmd['action'] == 'find' and cmd['target'] is None:
         await context.bot.send_message(chat_id, '不认识该目标。' + HELP)
         return
+
+    # `stop` must abort any laptop-side NavSession in addition to telling the
+    # Pi to switch to IDLE — otherwise the next tick re-issues a nav_pulse
+    # and the robot resumes navigating.
+    if cmd['action'] == 'stop':
+        stop_nav()
 
     if not post_command(cmd):
         await context.bot.send_message(chat_id, '小车失联')

@@ -499,7 +499,13 @@ class AgentNode(Node):
             self.nav_blocked = True
             self.mode = 'IDLE'
             return
+        # clamp to the agent's existing v_max / w_max as a safety net — the
+        # laptop NavSession already caps, but the Pi is the last line of
+        # defense against a misconfigured or buggy upstream command.
         vx, vy, wz = self.nav_twist
+        vx = max(-self.v_max, min(self.v_max, vx))
+        vy = max(-self.v_max, min(self.v_max, vy))
+        wz = max(-self.w_max, min(self.w_max, wz))
         self.publish_full_cmd(vx, vy, wz)
 
     def tick(self):

@@ -219,6 +219,12 @@ class SlamRunner:
             if cmd is not None and cmd.kind != 'stop':
                 self._send_nav(cmd, now)
             self._drain_pi_events()
+            # ARRIVED-on-first-tick (cmd.kind == 'stop') and FAILED('lost')
+            # from scan exhaustion reach terminal state WITHOUT a Pi event,
+            # so _drain_pi_events would never publish them — handle directly.
+            if (self.session_nav is not None
+                    and self.session_nav.state.value in ('ARRIVED', 'FAILED')):
+                self._publish_nav_done()
             if self.session_nav is not None:
                 nav_status = self.session_nav.state.value
         return len(tag_dets), located, nav_status
@@ -285,6 +291,10 @@ class SlamRunner:
                     runner._handle_candidates(self)
                 elif self.path == '/nav/goto':
                     runner._handle_goto(self)
+                elif self.path == '/nav/stop':
+                    runner.stop_goto()
+                    self.send_response(200)
+                    self.end_headers()
                 else:
                     self.send_response(404)
                     self.end_headers()
@@ -390,6 +400,13 @@ class SlamRunner:
         try:
             self.http.post(self.cmd_url, json=payload, timeout=0.5)
         except Exception:                           # noqa: BLE001
+            # Pi unreachable — release the WAITING_PULSE latch so the next
+            # tick retries instead of stalling forever for a pulse_done that
+            # will never arrive.
+            from slam.nav_session import State
+            if (self.session_nav is not None
+                    and self.session_nav.state is State.WAITING_PULSE):
+                self.session_nav.state = State.DRIVING
             return
         self.dead_reckoner.record_pulse(cmd.vx, cmd.vy, cmd.wz,
                                         cmd.seconds, now)
