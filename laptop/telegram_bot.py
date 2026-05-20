@@ -218,7 +218,6 @@ def _run_chain(loop, context, chat_id, target):
     """SEARCH first; on timeout fall back to NAV via the nav api."""
     import asyncio
     deadline = time.time() + SEARCH_TIMEOUT_SEC
-    arrived = False
     while time.time() < deadline:
         time.sleep(0.7)
         st = get_status()
@@ -226,15 +225,12 @@ def _run_chain(loop, context, chat_id, target):
             continue
         ev = st.get('event', '')
         if ev.startswith('arrived:'):
-            arrived = True
             target_name = ev.split(':', 1)[1]
             asyncio.run_coroutine_threadsafe(
                 context.bot.send_message(chat_id, f'已到达 {target_name}'), loop)
             asyncio.run_coroutine_threadsafe(
                 _send_photo(context, chat_id, f'到达 {target_name}'), loop)
             return
-    if arrived:
-        return
     asyncio.run_coroutine_threadsafe(
         context.bot.send_message(chat_id,
             f'{SEARCH_TIMEOUT_SEC:.0f}s 未发现 {target}, 改用地图导航'), loop)
