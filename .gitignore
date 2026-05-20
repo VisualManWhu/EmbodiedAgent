@@ -24,3 +24,7 @@ laptop/telegram_bot_config.txt
 
 # Claude Code worktrees / local state
 .claude/
+
+3dscene/
+
+docs/report.pptx

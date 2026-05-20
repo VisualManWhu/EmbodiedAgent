@@ -6,7 +6,7 @@
 BOT_TOKEN=PUT-YOUR-BOTFATHER-TOKEN-HERE
 
 # Raspberry Pi IP address
-PI_IP=192.168.178.12
+PI_IP=172.20.10.4
 
 # Your Telegram numeric user id(s). Comma-separated for multiple.
 AUTHORIZED_IDS=123456789
