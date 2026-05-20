@@ -120,6 +120,10 @@ class SlamRunner:
 
         self.renderer = MapRenderer()
         self.map_server = MapImageServer(map_port)
+        self.nav_api_port = map_port + 1            # default 8092
+        self._nav_done_lock = threading.Lock()
+        self._nav_done_event = None
+        self._start_nav_api()
         self.post_url = f'http://{pi_ip}:{semantic_port}/map'
         self.tags_payload = [
             {'id': i, 'x': e['x'], 'y': e['y'], 'z': e.get('z', 0.0)}
@@ -246,6 +250,86 @@ class SlamRunner:
         except OSError as e:
             print(f'warning: could not save semantic map: {e}')
 
+    def _start_nav_api(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import json as _json
+        runner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                if self.path == '/nav/done':
+                    with runner._nav_done_lock:
+                        ev = runner._nav_done_event
+                        runner._nav_done_event = None
+                    body = _json.dumps(ev or {}).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def do_POST(self):
+                if self.path == '/nav/candidates':
+                    runner._handle_candidates(self)
+                elif self.path == '/nav/goto':
+                    runner._handle_goto(self)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        server = ThreadingHTTPServer(('127.0.0.1', self.nav_api_port), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        print(f'nav api at http://127.0.0.1:{self.nav_api_port}/')
+
+    def _handle_candidates(self, h):
+        import json as _json
+        from slam.landmark_selector import by_class
+        n = int(h.headers.get('Content-Length', 0))
+        body = _json.loads(h.rfile.read(n))
+        cls = body['target_class']
+        robot = self.last_robot or (0.0, 0.0, 0.0)
+        cands = by_class(self.smap, cls, (robot[0], robot[1]),
+                         conf_min=self.landmark_conf_min)
+        out = [{'id': lm.id, 'label': lm.label,
+                'x': float(lm.position[0]), 'y': float(lm.position[1]),
+                'dist_m': float(((lm.position[0]-robot[0])**2
+                                 + (lm.position[1]-robot[1])**2) ** 0.5)}
+               for lm in cands]
+        resp = _json.dumps({'candidates': out}).encode()
+        h.send_response(200)
+        h.send_header('Content-Type', 'application/json')
+        h.send_header('Content-Length', str(len(resp)))
+        h.end_headers()
+        h.wfile.write(resp)
+
+    def _handle_goto(self, h):
+        import json as _json
+        from slam.landmark_selector import by_id, by_tag
+        n = int(h.headers.get('Content-Length', 0))
+        req = _json.loads(h.rfile.read(n))
+        if 'landmark_id' in req:
+            lm = by_id(self.smap, req['landmark_id'])
+            if lm is None:
+                h.send_response(404); h.end_headers(); return
+            self.start_goto((float(lm.position[0]), float(lm.position[1])),
+                            lm.id, lm.label)
+        elif 'tag_id' in req:
+            xy = by_tag(self.tag_map, req['tag_id'])
+            if xy is None:
+                h.send_response(404); h.end_headers(); return
+            self.start_goto(xy, None, f"tag{req['tag_id']}")
+        elif 'xy' in req:
+            self.start_goto(tuple(req['xy']), None, req.get('label', 'point'))
+        else:
+            h.send_response(400); h.end_headers(); return
+        h.send_response(200); h.end_headers()
+
     # ---- navigation lifecycle ------------------------------------------
 
     def start_goto(self, goal_xy, goal_id, goal_label):
@@ -296,12 +380,14 @@ class SlamRunner:
     def _publish_nav_done(self):
         reason = (self.session_nav.fail_reason
                   if self.session_nav.state.value == 'FAILED' else None)
-        result = {'event': 'nav_done',
-                  'state': self.session_nav.state.value,
-                  'goal_label': self.session_nav.goal_label,
-                  'goal_id': self.session_nav.goal_id,
-                  'reason': reason}
-        print(f'NAV result: {result}')
+        ev = {'event': 'nav_done',
+              'state': self.session_nav.state.value,
+              'goal_label': self.session_nav.goal_label,
+              'goal_id': self.session_nav.goal_id,
+              'reason': reason}
+        print(f'NAV result: {ev}')
+        with self._nav_done_lock:
+            self._nav_done_event = ev
         if self.session_nav.state.value == 'FAILED':
             try:
                 self.http.post(self.cmd_url,
