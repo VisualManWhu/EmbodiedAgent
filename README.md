@@ -294,9 +294,6 @@ For mapping verification see the semantic-SLAM phase plan in
 
 ## TODO
 
-- **Side-IR is now consumed by NAV mode for blocked events** but is not
-  yet used in the SEARCH/APPROACHING discrete-pulse loop. Wiring it into
-  SEARCH would let the legacy reactive search also avoid obstacles too.
 - **Auto-built tag pose graph.** Today tag positions are hand-measured.
   Auto-solving the tag layout from co-visible observations would remove
   the manual measurement step at the cost of some drift.

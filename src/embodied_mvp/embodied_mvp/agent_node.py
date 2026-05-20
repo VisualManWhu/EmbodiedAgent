@@ -244,6 +244,24 @@ class AgentNode(Node):
         v.y = pitch
         self.pt_pub.publish(v)
 
+    def _side_ir_bias(self) -> float:
+        """Yaw bias (rad/s) to steer away from a triggered side IR.
+
+        ``+wz`` = rotate left in this codebase, so obstacle on the LEFT biases
+        negative (turn right) and obstacle on the RIGHT biases positive (turn
+        left). Returns 0 when side IR is disabled or both sides clear; if both
+        sides hit the biases cancel and the caller should already be slowing /
+        stopping via the front sensor.
+        """
+        if not self.side_ir_enabled:
+            return 0.0
+        bias = 0.0
+        if self.obs_left:
+            bias -= self.avoid_bias
+        if self.obs_right:
+            bias += self.avoid_bias
+        return bias
+
     def _dir_to_twist(self, direction):
         f, s, y = self.manual_fwd, self.manual_strafe, self.manual_yaw
         return {
@@ -405,8 +423,14 @@ class AgentNode(Node):
             return
 
         if now < self.burst_end:
-            # mid-pulse — keep executing the committed move
-            self.publish_cmd(self.burst_vx, self.burst_wz)
+            # mid-pulse — keep executing the committed move, but if a side IR
+            # fires DURING a forward burst, blend in a yaw bias to steer away
+            # from the obstacle instead of plowing into it.
+            wz = self.burst_wz
+            if self.burst_vx > 0:
+                wz = max(-self.w_max,
+                         min(self.w_max, wz + self._side_ir_bias()))
+            self.publish_cmd(self.burst_vx, wz)
             return
 
         # pulse finished — stop
@@ -436,6 +460,11 @@ class AgentNode(Node):
                 self.burst_wz = max(-self.steer_max, min(self.steer_max, steer))
             else:
                 self.burst_wz = 0.0
+            # blend in side-IR avoidance so the forward pulse curves away
+            # from a left/right obstacle instead of grazing it.
+            self.burst_wz = max(-self.w_max,
+                                min(self.w_max,
+                                    self.burst_wz + self._side_ir_bias()))
             self.burst_end = now + self.fwd_step_sec
 
     def tick_manual(self, now):
