@@ -6,10 +6,12 @@ and rotate-photo events back to the phone.
 
 Setup:
     pip install python-telegram-bot requests
-Config: set BOT_TOKEN, PI_IP, AUTHORIZED_IDS below.
+    cp laptop/telegram_bot_config.example.txt laptop/telegram_bot_config.txt
+    # edit telegram_bot_config.txt — BOT_TOKEN, PI_IP, AUTHORIZED_IDS
 Run:    python telegram_bot.py
 """
 import io
+import sys
 import threading
 import time
 
@@ -18,12 +20,13 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
 from nl_parser import parse, SUPPORTED_TARGETS_CN
+from secrets_loader import load_bot_secrets
 
-# ---- config ----
-BOT_TOKEN = ''
-PI_IP = ''
-AUTHORIZED_IDS = {}        # your Telegram numeric user id(s)
-# ----------------
+try:
+    BOT_TOKEN, PI_IP, AUTHORIZED_IDS = load_bot_secrets()
+except (FileNotFoundError, ValueError) as _e:
+    print(f'config error: {_e}', file=sys.stderr)
+    sys.exit(1)
 
 CMD_URL = f'http://{PI_IP}:9091/command'
 STATUS_URL = f'http://{PI_IP}:9091/status'
@@ -34,7 +37,8 @@ DETECTOR_URL = 'http://127.0.0.1:8090/annotated'
 MAP_URL = 'http://127.0.0.1:8091/map.png'
 
 HELP = ('支持指令：前进/后退/左移/右移/左转/右转/停/拍照/旋转拍照/地图/'
-        '去找<目标>。目标：' + SUPPORTED_TARGETS_CN)
+        '去找<目标>。可加时长：前进3秒、后退2秒(最长30秒)。'
+        '目标：' + SUPPORTED_TARGETS_CN)
 
 PHOTO_LABELS = {1: '前', 2: '右', 3: '后', 4: '左'}
 

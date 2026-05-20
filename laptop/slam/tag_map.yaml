@@ -1,8 +1,6 @@
-# AprilTag layout — hand-measured anchor poses defining the map frame.
-#
-# Print tag36h11 markers, place them around the room roughly at the robot's
-# camera height, then measure each tag and fill in this file. The tags must
-# not move afterwards.
+# AprilTag layout TEMPLATE — example geometry only. Real measurements go in
+# `tag_map.local.yaml` (gitignored) so room layout never reaches the repo.
+# load_tag_map() prefers tag_map.local.yaml if present, falling back to this.
 #
 # Map frame: x-y on the floor, z up. Tag 0 IS the origin by convention.
 # Per tag:
@@ -10,12 +8,6 @@
 #   yaw_deg   compass direction the tag FACE points, in the x-y plane
 #             (0 = +x, 90 = +y). A tag on a wall faces into the room.
 #   size_m    side length of the black tag square, in metres
-#
-# Measuring tip: pick one wall corner as the origin, +x along one wall,
-# +y along the other. Measure each tag with a tape; yaw is which way the
-# printed face looks.
-#
-# The entries below are a TEMPLATE — replace with your real measurements.
 tags:
   0:
     x: 0.0

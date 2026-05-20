@@ -1,0 +1,11 @@
+# Copy this file to `telegram_bot_config.txt` (gitignored) and fill in the
+# real values. Loaded by laptop/secrets_loader.py for telegram_bot.py.
+
+# Telegram bot token issued by BotFather (KEEP SECRET — never commit).
+BOT_TOKEN=
+
+# Raspberry Pi IP on the current network.
+PI_IP=172.20.10.4
+
+# Comma-separated Telegram numeric user IDs allowed to control the bot.
+AUTHORIZED_IDS=

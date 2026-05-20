@@ -14,7 +14,16 @@ from . import transforms
 
 
 def load_tag_map(path: str) -> dict:
-    """Load ``tag_map.yaml`` into ``{int id: {x, y, z, yaw_deg, size_m}}``."""
+    """Load ``tag_map.yaml`` into ``{int id: {x, y, z, yaw_deg, size_m}}``.
+
+    If a sibling ``tag_map.local.yaml`` exists it is preferred — real room
+    measurements live in the gitignored ``.local`` file so the tracked
+    ``tag_map.yaml`` stays as a template.
+    """
+    import os as _os
+    local = _os.path.join(_os.path.dirname(path), 'tag_map.local.yaml')
+    if _os.path.exists(local):
+        path = local
     with open(path, encoding='utf-8') as f:
         data = yaml.safe_load(f)
     return {int(k): v for k, v in data['tags'].items()}
