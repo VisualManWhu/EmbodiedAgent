@@ -181,10 +181,15 @@ class SemanticMap:
             # negative evidence: expected in view this frame but not detected.
             if self._in_fov(lm, T_map_cam, K, w, h):
                 lm.miss_count += 1
-            if lm.miss_count >= self.cfg.miss_prune:
-                del self.landmarks[lm.id]
-            elif lm.state == CONFIRMED and lm.miss_count >= self.cfg.miss_demote:
+            # CONFIRMED never deleted directly by misses — only DEMOTED. A
+            # ghost has to survive miss_demote AND the tentative_stale window
+            # before it vanishes, so a confirmed object can't disappear from
+            # one bad sweep where YOLO simply failed to redetect it.
+            if lm.state == CONFIRMED and lm.miss_count >= self.cfg.miss_demote:
                 lm.state = TENTATIVE
+            elif (lm.state == TENTATIVE
+                  and lm.miss_count >= self.cfg.miss_prune):
+                del self.landmarks[lm.id]
             elif (lm.state == TENTATIVE
                   and now - lm.last_seen_t > self.cfg.tentative_stale_sec):
                 del self.landmarks[lm.id]

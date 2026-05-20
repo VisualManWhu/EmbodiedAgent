@@ -56,6 +56,21 @@ def test_map():
     assert parse('map') == {'action': 'map'}
 
 
+def test_move_with_duration():
+    assert parse('前进3秒') == {'action': 'move', 'dir': 'forward', 'seconds': 3.0}
+    assert parse('后退 2 秒') == {'action': 'move', 'dir': 'backward', 'seconds': 2.0}
+    assert parse('左转1.5秒') == {'action': 'move', 'dir': 'rotate_left', 'seconds': 1.5}
+    assert parse('forward 4s') == {'action': 'move', 'dir': 'forward', 'seconds': 4.0}
+    # no duration -> no 'seconds' key (agent_node falls back to manual_step_sec)
+    assert parse('前进') == {'action': 'move', 'dir': 'forward'}
+
+
+def test_move_duration_capped():
+    # safety cap so a typo cannot drive the car for minutes
+    assert parse('前进300秒')['seconds'] == 30.0
+    assert parse('前进0秒')['seconds'] == 0.2
+
+
 def test_unparseable():
     assert parse('帮我把灯关了') is None
     assert parse('') is None

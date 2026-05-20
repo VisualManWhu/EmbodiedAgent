@@ -24,8 +24,8 @@ Setup (Windows PowerShell):
     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 Run:
-    python laptop_detector.py --pi 192.168.178.37
-    python laptop_detector.py --pi 192.168.178.37 --slam
+    python laptop_detector.py --pi 172.20.10.4
+    python laptop_detector.py --pi 172.20.10.4 --slam
 
 Stop: press q in the preview window, or Ctrl+C.
 """
@@ -88,26 +88,35 @@ class SlamRunner:
     SAVE_INTERVAL = 15.0
 
     def __init__(self, pi_ip, semantic_port, map_port, tag_map_path,
-                 intrinsics_path, map_json_path, cam_height_m):
+                 intrinsics_path, map_json_path, cam_height_m,
+                 fusion_overrides=None):
         from slam import camera_calib
         from slam.apriltag_detector import AprilTagDetector
         from slam.pose_estimator import PoseEstimator, load_tag_map
-        from slam.semantic_map import SemanticMap
+        from slam.semantic_map import FusionConfig, SemanticMap
         from slam.map_renderer import MapRenderer, MapImageServer
 
         self.K, self.dist, _ = camera_calib.load_intrinsics(intrinsics_path)
         self.tag_map = load_tag_map(tag_map_path)
+        cfg = FusionConfig()
+        for k, v in (fusion_overrides or {}).items():
+            if v is not None:
+                setattr(cfg, k, v)
+        print(f'fusion: gate={cfg.gate_radius_m}m  '
+              f'confirm>={cfg.confirm_min_obs}obs/{cfg.confirm_min_viewpoints}views  '
+              f'stale={cfg.tentative_stale_sec}s  '
+              f'miss={cfg.miss_demote}/{cfg.miss_prune}')
         self.tag_detector = AprilTagDetector()
         mount = {'forward_m': 0.0, 'lateral_m': 0.0, 'height_m': cam_height_m}
         self.pose_est = PoseEstimator(self.tag_map, self.K, self.dist, mount)
 
         self.map_json_path = map_json_path
         if os.path.exists(map_json_path):
-            self.smap = SemanticMap.load(map_json_path)
+            self.smap = SemanticMap.load(map_json_path, cfg)
             print(f'semantic map: loaded {len(self.smap.landmarks)} landmarks '
                   f'from {map_json_path}')
         else:
-            self.smap = SemanticMap()
+            self.smap = SemanticMap(cfg)
 
         self.renderer = MapRenderer()
         self.map_server = MapImageServer(map_port)
@@ -209,8 +218,21 @@ def main():
                     default=os.path.join(_slam_dir, 'camera_intrinsics.yaml'))
     ap.add_argument('--map-json',
                     default=os.path.join(_slam_dir, 'semantic_map.json'))
-    ap.add_argument('--cam-height', type=float, default=0.30,
+    ap.add_argument('--cam-height', type=float, default=0.15,
                     help='camera height above the floor (m), pan/tilt centred')
+    # fusion tuning — leave None to keep SemanticMap defaults
+    ap.add_argument('--gate-radius', type=float, default=None,
+                    help='detection<->landmark association radius (m)')
+    ap.add_argument('--confirm-min-obs', type=int, default=None,
+                    help='detections needed to CONFIRM a landmark')
+    ap.add_argument('--confirm-min-viewpoints', type=int, default=None,
+                    help='distinct viewpoints needed to CONFIRM')
+    ap.add_argument('--tentative-stale-sec', type=float, default=None,
+                    help='prune TENTATIVE landmarks idle this long (s)')
+    ap.add_argument('--miss-demote', type=int, default=None,
+                    help='in-FOV misses that demote a CONFIRMED landmark')
+    ap.add_argument('--miss-prune', type=int, default=None,
+                    help='in-FOV misses that prune any landmark')
     args = ap.parse_args()
 
     snapshot_url = f'http://{args.pi}:{args.stream_port}/snapshot'
@@ -225,10 +247,18 @@ def main():
 
     slam = None
     if args.slam:
+        fusion_overrides = {
+            'gate_radius_m': args.gate_radius,
+            'confirm_min_obs': args.confirm_min_obs,
+            'confirm_min_viewpoints': args.confirm_min_viewpoints,
+            'tentative_stale_sec': args.tentative_stale_sec,
+            'miss_demote': args.miss_demote,
+            'miss_prune': args.miss_prune,
+        }
         try:
             slam = SlamRunner(args.pi, args.semantic_port, args.map_port,
                               args.tag_map, args.intrinsics, args.map_json,
-                              args.cam_height)
+                              args.cam_height, fusion_overrides)
         except (ImportError, FileNotFoundError, KeyError) as e:
             print(f'semantic SLAM disabled: {e}')
             slam = None

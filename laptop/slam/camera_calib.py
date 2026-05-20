@@ -12,7 +12,7 @@ resolution:
 
 Or grab the shots straight from the running Pi camera first:
 
-    python -m slam.camera_calib capture --url http://192.168.178.37:8080/snapshot --out calib_shots
+    python -m slam.camera_calib capture --url http://172.20.10.4:8080/snapshot --out calib_shots
 """
 import argparse
 import glob
@@ -49,15 +49,32 @@ def save_intrinsics(path: str, K, dist, image_size, rms: float | None = None):
         yaml.safe_dump(d, f, sort_keys=False)
 
 
-def calibrate_from_images(image_paths, cols: int, rows: int, square_m: float):
+def _per_view_errors(obj_points, img_points, K, dist, rvecs, tvecs):
+    """RMS reprojection error (px) for each calibration view."""
+    errs = []
+    for objp, imgp, rv, tv in zip(obj_points, img_points, rvecs, tvecs):
+        proj, _ = cv2.projectPoints(objp, rv, tv, K, dist)
+        proj = proj.reshape(-1, 2)
+        errs.append(float(np.sqrt(np.mean(
+            np.sum((proj - imgp.reshape(-1, 2)) ** 2, axis=1)))))
+    return errs
+
+
+def calibrate_from_images(image_paths, cols: int, rows: int, square_m: float,
+                          max_view_error: float | None = None):
     """Chessboard calibration. ``cols``/``rows`` = count of inner corners.
 
-    Returns ``(K, dist, rms, image_size, n_used)``.
+    If ``max_view_error`` is set, views whose reprojection error exceeds it are
+    dropped and the calibration is recomputed once on the survivors — bad shots
+    (motion blur, glare, non-flat board) otherwise inflate the overall RMS.
+
+    Returns ``(K, dist, rms, image_size, names, per_view_errors)`` where the
+    name/error lists cover only the views kept in the final calibration.
     """
     objp = np.zeros((rows * cols, 3), np.float32)
     objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * square_m
 
-    obj_points, img_points = [], []
+    obj_points, img_points, names = [], [], []
     image_size = None
     for path in image_paths:
         img = cv2.imread(path)
@@ -74,14 +91,35 @@ def calibrate_from_images(image_paths, cols: int, rows: int, square_m: float):
             (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
         obj_points.append(objp)
         img_points.append(corners)
+        names.append(os.path.basename(path))
         print(f'  ok: {os.path.basename(path)}')
 
     if len(obj_points) < 5:
         raise RuntimeError(
             f'need >= 5 good chessboard views, got {len(obj_points)}')
-    rms, K, dist, _, _ = cv2.calibrateCamera(
+
+    rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
         obj_points, img_points, image_size, None, None)
-    return K, dist, rms, image_size, len(obj_points)
+    errs = _per_view_errors(obj_points, img_points, K, dist, rvecs, tvecs)
+
+    if max_view_error is not None:
+        keep = [i for i, e in enumerate(errs) if e <= max_view_error]
+        dropped = [names[i] for i in range(len(names)) if i not in keep]
+        if dropped and len(keep) >= 5:
+            for nm in dropped:
+                print(f'  dropped (view error > {max_view_error} px): {nm}')
+            obj_points = [obj_points[i] for i in keep]
+            img_points = [img_points[i] for i in keep]
+            names = [names[i] for i in keep]
+            rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+                obj_points, img_points, image_size, None, None)
+            errs = _per_view_errors(obj_points, img_points, K, dist,
+                                    rvecs, tvecs)
+        elif dropped:
+            print(f'  WARNING: {len(dropped)} view(s) exceed '
+                  f'{max_view_error} px but too few would remain — kept all')
+
+    return K, dist, rms, image_size, names, errs
 
 
 def _cmd_capture(args):
@@ -113,10 +151,19 @@ def _cmd_capture(args):
 
 def _cmd_calibrate(args):
     paths = sorted(glob.glob(os.path.join(args.images, '*')))
-    K, dist, rms, size, n = calibrate_from_images(
-        paths, args.cols, args.rows, args.square_m)
+    K, dist, rms, size, names, errs = calibrate_from_images(
+        paths, args.cols, args.rows, args.square_m, args.max_view_error)
+
+    print('\nper-view reprojection error (worst first):')
+    for nm, e in sorted(zip(names, errs), key=lambda p: -p[1]):
+        flag = '  <-- high' if e > 1.0 else ''
+        print(f'  {e:5.2f} px  {nm}{flag}')
+
     save_intrinsics(args.out, K, dist, size, rms)
-    print(f'\ncalibrated from {n} views, RMS reproj error {rms:.3f} px')
+    print(f'\ncalibrated from {len(names)} views, RMS reproj error {rms:.3f} px')
+    if rms > 0.7:
+        print('  RMS still high — reshoot the high-error views (see tips), '
+              'or lower --max-view-error')
     print(f'wrote {args.out}')
 
 
@@ -134,6 +181,9 @@ def main():
     cal.add_argument('--cols', type=int, default=9, help='inner corners per row')
     cal.add_argument('--rows', type=int, default=6, help='inner corners per col')
     cal.add_argument('--square-m', type=float, default=0.025)
+    cal.add_argument('--max-view-error', type=float, default=None,
+                     help='drop views above this reprojection error (px) and '
+                          'recalibrate, e.g. 0.8')
     cal.add_argument('--out', default=DEFAULT_PATH)
     cal.set_defaults(func=_cmd_calibrate)
 
