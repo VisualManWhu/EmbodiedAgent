@@ -165,12 +165,74 @@ def _poll_nav(loop, context, chat_id, stop_after_sec=300):
             f'导航超时 ({stop_after_sec:.0f}s 无结果)'), loop)
 
 
+def _fetch_list(path):
+    try:
+        r = _session.get(f'{NAV_API}/{path}', timeout=3.0)
+        return r.json()
+    except requests.RequestException:
+        return {}
+
+
+def _wait_for_nav_done(timeout_sec):
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        time.sleep(0.7)
+        ev = poll_nav_done()
+        if ev:
+            return ev
+    return None
+
+
 def _run_patrol(loop, context, chat_id):
-    pass
+    import asyncio
+    data = _fetch_list('nav/landmarks')
+    landmarks = data.get('landmarks', [])
+    if not landmarks:
+        asyncio.run_coroutine_threadsafe(
+            context.bot.send_message(chat_id, '地图中没有 CONFIRMED 物体'), loop)
+        return
+    for lm in landmarks:
+        asyncio.run_coroutine_threadsafe(
+            context.bot.send_message(chat_id,
+                f"前往 {lm['label']} id {lm['id']} ..."), loop)
+        if not start_goto_id(lm['id']):
+            continue
+        ev = _wait_for_nav_done(180.0)
+        if ev is None or ev.get('state') != 'ARRIVED':
+            asyncio.run_coroutine_threadsafe(
+                context.bot.send_message(chat_id,
+                    f"跳过 {lm['label']} id {lm['id']} ({ev.get('reason') if ev else 'timeout'})"),
+                loop)
+            continue
+        asyncio.run_coroutine_threadsafe(
+            _send_photo(context, chat_id,
+                        f"{lm['label']} id {lm['id']}"), loop)
+    asyncio.run_coroutine_threadsafe(
+        context.bot.send_message(chat_id, '巡逻完成'), loop)
 
 
 def _run_room_tour(loop, context, chat_id):
-    pass
+    import asyncio
+    data = _fetch_list('nav/tags')
+    tags = sorted(data.get('tags', []), key=lambda t: t['id'])
+    if not tags:
+        asyncio.run_coroutine_threadsafe(
+            context.bot.send_message(chat_id, 'tag_map 为空'), loop)
+        return
+    for t in tags:
+        asyncio.run_coroutine_threadsafe(
+            context.bot.send_message(chat_id, f"前往 tag {t['id']} ..."), loop)
+        if not start_goto_tag(t['id']):
+            continue
+        ev = _wait_for_nav_done(180.0)
+        if ev is None or ev.get('state') != 'ARRIVED':
+            asyncio.run_coroutine_threadsafe(
+                context.bot.send_message(chat_id,
+                    f"跳过 tag {t['id']} ({ev.get('reason') if ev else 'timeout'})"),
+                loop)
+            continue
+    asyncio.run_coroutine_threadsafe(
+        context.bot.send_message(chat_id, '绕室完成'), loop)
 
 
 async def _send_photo(context, chat_id, caption):

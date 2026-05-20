@@ -272,6 +272,10 @@ class SlamRunner:
                     self.send_header('Content-Length', str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
+                elif self.path == '/nav/landmarks':
+                    runner._handle_landmarks_list(self)
+                elif self.path == '/nav/tags':
+                    runner._handle_tags_list(self)
                 else:
                     self.send_response(404)
                     self.end_headers()
@@ -336,6 +340,27 @@ class SlamRunner:
         else:
             h.send_response(400); h.end_headers(); return
         h.send_response(200); h.end_headers()
+
+    def _handle_landmarks_list(self, h):
+        import json as _json
+        snap = self.smap.snapshot(confirmed_only=True)
+        body = _json.dumps({'landmarks': snap}).encode()
+        h.send_response(200)
+        h.send_header('Content-Type', 'application/json')
+        h.send_header('Content-Length', str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
+
+    def _handle_tags_list(self, h):
+        import json as _json
+        tags = [{'id': i, 'x': float(e['x']), 'y': float(e['y'])}
+                for i, e in self.tag_map.items()]
+        body = _json.dumps({'tags': tags}).encode()
+        h.send_response(200)
+        h.send_header('Content-Type', 'application/json')
+        h.send_header('Content-Length', str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
 
     # ---- navigation lifecycle ------------------------------------------
 
