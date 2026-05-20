@@ -1,16 +1,47 @@
 """Keyword parser: Chinese / English text -> structured command dict.
 
 parse(text) returns one of:
-  {'action': 'move', 'dir': 'forward'|'backward'|'left'|'right'|'rotate_left'|'rotate_right'}
+  {'action': 'move', 'dir': 'forward'|'backward'|'left'|'right'|'rotate_left'|'rotate_right',
+                     'seconds': <optional float>}   # duration if user said "...3秒" / "...5s"
   {'action': 'stop'}
   {'action': 'photo'}
   {'action': 'rotate_photo'}
+  {'action': 'map'}                               # request the semantic map
   {'action': 'find', 'target': '<coco_class>'}   # target None if unrecognised
   None  -- unparseable
+
+Duration is capped at MAX_DURATION_SEC as a safety stop so a fat-fingered
+"前进300秒" cannot run the car away unattended.
 
 Targets cover the full COCO-80 class set. Aliases are matched longest-first so
 short aliases (e.g. '车') never shadow longer ones (e.g. '自行车').
 """
+
+import re
+
+MAX_DURATION_SEC = 30.0
+MIN_DURATION_SEC = 0.2
+
+_DURATION_RE = re.compile(
+    r'(\d+(?:\.\d+)?)\s*(?:秒钟|秒|sec(?:onds?)?|s\b)', re.IGNORECASE)
+
+
+def _extract_duration(text):
+    """Return a duration in seconds parsed from ``text``, or None."""
+    m = _DURATION_RE.search(text)
+    if not m:
+        return None
+    s = float(m.group(1))
+    return max(MIN_DURATION_SEC, min(MAX_DURATION_SEC, s))
+
+
+def _move(direction, text):
+    cmd = {'action': 'move', 'dir': direction}
+    sec = _extract_duration(text)
+    if sec is not None:
+        cmd['seconds'] = sec
+    return cmd
+
 
 # Chinese alias -> COCO class name (full COCO-80 coverage)
 TARGET_MAP = {
@@ -148,6 +179,9 @@ def parse(text):
     if any(k in t for k in ('旋转拍照', '环拍', '转一圈拍照', '转圈拍照')):
         return {'action': 'rotate_photo'}
 
+    if any(k in t for k in ('地图', '语义地图', 'map')):
+        return {'action': 'map'}
+
     if any(k in t for k in ('停', 'stop')):
         return {'action': 'stop'}
 
@@ -159,16 +193,16 @@ def parse(text):
 
     # rotation before plain strafe ('左转' contains '左')
     if any(k in t for k in ('左转', 'turn left', 'rotate left')):
-        return {'action': 'move', 'dir': 'rotate_left'}
+        return _move('rotate_left', t)
     if any(k in t for k in ('右转', 'turn right', 'rotate right')):
-        return {'action': 'move', 'dir': 'rotate_right'}
+        return _move('rotate_right', t)
     if any(k in t for k in ('左移', '向左', '左')):
-        return {'action': 'move', 'dir': 'left'}
+        return _move('left', t)
     if any(k in t for k in ('右移', '向右', '右')):
-        return {'action': 'move', 'dir': 'right'}
+        return _move('right', t)
     if any(k in t for k in ('前进', '往前', '向前', '前', 'forward')):
-        return {'action': 'move', 'dir': 'forward'}
+        return _move('forward', t)
     if any(k in t for k in ('后退', '倒退', '后', 'backward', 'back')):
-        return {'action': 'move', 'dir': 'backward'}
+        return _move('backward', t)
 
     return None

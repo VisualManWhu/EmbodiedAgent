@@ -18,7 +18,7 @@ Next phase (not started): **semantic SLAM** — see the section below.
 
 ## Hardware
 
-- **Raspberry Pi 5** (4 GB), Raspbian Bookworm. On home WiFi, IP `192.168.178.12`.
+- **Raspberry Pi 5** (4 GB), Raspbian Bookworm. WiFi IP `172.20.10.4` (was `192.168.178.37`).
 - **Makerobo (创乐博) mecanum 4WD kit.** Vendor control library `LOBOROBOT`
   (vendored + smbus→smbus2-patched as `loborobot_lib.py`).
   - 4 motors via PCA9685 (I2C `0x40`); motor-D direction also uses GPIO 24/25.

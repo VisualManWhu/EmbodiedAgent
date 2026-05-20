@@ -9,6 +9,9 @@ Usage:
 Run YOLO on the Pi instead (no laptop):
   ros2 launch embodied_mvp mvp.launch.py enable_yolo:=true enable_bridge:=false
 
+Enable the semantic-SLAM map viewer (pair with laptop_detector --slam):
+  ros2 launch embodied_mvp mvp.launch.py enable_semantic_map:=true
+
 Override params file:
   ros2 launch embodied_mvp mvp.launch.py params_file:=/path/to/params.yaml
 """
@@ -30,6 +33,7 @@ def generate_launch_description():
     enable_search = LaunchConfiguration('enable_search')
     enable_stream = LaunchConfiguration('enable_stream')
     enable_bridge = LaunchConfiguration('enable_bridge')
+    enable_semantic_map = LaunchConfiguration('enable_semantic_map')
 
     IfCondition = __import__('launch.conditions', fromlist=['IfCondition']).IfCondition
 
@@ -40,6 +44,7 @@ def generate_launch_description():
         DeclareLaunchArgument('enable_search', default_value='true'),
         DeclareLaunchArgument('enable_stream', default_value='true'),
         DeclareLaunchArgument('enable_bridge', default_value='true'),   # receive laptop detections
+        DeclareLaunchArgument('enable_semantic_map', default_value='false'),  # semantic-SLAM map viewer
 
         # CSI camera: custom node spawns system rpicam-vid, publishes /camera/image_raw.
         Node(
@@ -73,4 +78,10 @@ def generate_launch_description():
         Node(package='embodied_mvp', executable='mjpeg_node', name='mjpeg_node',
              parameters=[params_file],
              condition=IfCondition(enable_stream)),
+
+        # Semantic-SLAM map viewer: receives the map POSTed by the laptop and
+        # republishes it as RViz markers + TF. Off by default.
+        Node(package='embodied_mvp', executable='semantic_map_node',
+             name='semantic_map_node', parameters=[params_file],
+             condition=IfCondition(enable_semantic_map)),
     ])

@@ -30,6 +30,7 @@ setup(
             'agent_node = embodied_mvp.agent_node:main',
             'mjpeg_node = embodied_mvp.mjpeg_node:main',
             'det_bridge_node = embodied_mvp.det_bridge_node:main',
+            'semantic_map_node = embodied_mvp.semantic_map_node:main',
         ],
     },
 )

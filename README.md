@@ -1,136 +1,288 @@
-# EmbodiedAgent — Pi5 Mecanum Search-and-Approach MVP
+# EmbodiedAgent — Pi5 Mecanum Search-and-Map Robot
 
-ROS2 Humble package for a Raspberry Pi 5 mecanum-wheel car: detects a COCO object via USB camera and visually servos toward it, stopping on IR proximity.
+A Raspberry Pi 5 mecanum-wheel car that:
 
-Plan: `C:\Users\yanfeng\.claude\plans\5-4g-rgb-4000ma-raspbian-bookworm-rtx40-abundant-garden.md`
+1. **Searches and approaches** COCO objects via camera → YOLO → visual servo (MVP).
+2. **Listens for natural-language commands** from a phone over Telegram
+   (motion, photo, rotate-photo, find-by-class).
+3. **Builds a semantic map** of the room — AprilTag-anchored localization
+   plus multi-view-fused object landmarks (semantic SLAM phase 1).
+
+Detection runs on a laptop GPU and POSTs results back to the Pi, so the Pi's
+CPU/battery BMS stays light. See [`docs/CONTEXT.md`](docs/CONTEXT.md) for the
+full background, gotchas, and decisions log.
 
 ## Architecture
 
 ```
-camera ──► yolo_node ──► /detections ──┐
-                                       ├──► search_node ──► /cmd_vel ──► motor_node ──► wheels
-ir_node ──► /ir/range  ────────────────┘                  └► /pantilt/cmd ──► pantilt_node
+Phone (Telegram)
+  | Telegram
+Laptop (Windows + RTX 4060):
+  telegram_bot.py    — keyword parser, posts commands to Pi
+  laptop_detector.py — pulls Pi /snapshot, runs YOLOv8x + AprilTag,
+                       fuses semantic map, serves map.png :8091
+  | HTTP (LAN)
+Pi5 (ROS2 Humble, RoboStack conda env `ros_env`):
+  csi_camera_node    — spawns rpicam-vid → /camera/image_raw
+  motor_node         — mecanum kinematics; loborobot backend
+  ir_node            — HC-SR04 ultrasonic → /ir/range
+  side_ir_node       — binary side IR → /ir/left /ir/right
+  pantilt_node       — pan-tilt servos via PCA9685
+  det_bridge_node    — receives laptop detections (:9090) → /detections
+  mjpeg_node         — MJPEG stream + /snapshot (:8080); reports pan-tilt
+                       in /snapshot response headers
+  agent_node         — mode FSM (IDLE/MANUAL/SEARCH/ROTATE_PHOTO),
+                       sole /cmd_vel owner, command HTTP server :9091
+  semantic_map_node  — receives map JSON (:9092), publishes MarkerArray + TF
+  yolo_node          — on-Pi YOLO (OFF by default; detection is offloaded)
 ```
 
-All hardware nodes (`motor_node`, `ir_node`, `pantilt_node`) ship with **`mock` backend default** so the stack runs without hardware for software validation. Switch to real backends in `config/params.yaml` once kit specifics are known.
+Hardware-touching nodes (`motor_node`, `ir_node`, `pantilt_node`, etc.) all
+have a `mock` backend so the stack starts without hardware. Switch to real
+backends in [`src/embodied_mvp/config/params.yaml`](src/embodied_mvp/config/params.yaml).
+
+## Repo layout
+
+- [`src/embodied_mvp/`](src/embodied_mvp/) — ROS2 Humble package (Pi nodes, launch, params).
+- [`laptop/`](laptop/) — laptop-side scripts.
+  - [`laptop_detector.py`](laptop/laptop_detector.py) — YOLO + semantic SLAM.
+  - [`telegram_bot.py`](laptop/telegram_bot.py) — Telegram NL control.
+  - [`slam/`](laptop/slam/) — calibration, AprilTag detection, pose estimator,
+    semantic map, map renderer, printable target generator.
+- [`docs/CONTEXT.md`](docs/CONTEXT.md) — context + gotchas for picking up work.
+- [`docs/superpowers/`](docs/superpowers/) — design specs and plans.
 
 ## Pi5 first-time setup
 
 ```bash
-# 1. ROS2 Humble (via RoboStack conda — avoids Bookworm apt-pin gaps)
+# 1. ROS2 Humble via RoboStack conda (avoids Bookworm apt-pin gaps)
 curl -L https://micro.mamba.pm/install.sh | bash
 mamba create -n ros_env python=3.11 -c conda-forge -y
 mamba activate ros_env
 mamba install ros-humble-desktop ros-humble-v4l2-camera \
-              ros-humble-vision-msgs ros-humble-cv-bridge \
+              ros-humble-vision-msgs ros-humble-visualization-msgs \
+              ros-humble-tf2-ros ros-humble-cv-bridge \
               ros-humble-teleop-twist-keyboard \
               compilers cmake pkg-config -c robostack-staging -y
 
-# 2. Python deps
-pip install ultralytics opencv-python numpy pyserial
-# Servo (only if using pca9685 backend):
-pip install adafruit-circuitpython-servokit
+# 2. Python deps for kit drivers (when leaving `mock` backends)
+pip install pyserial adafruit-circuitpython-servokit smbus2
 
 # 3. Workspace
 mkdir -p ~/embodied_ws/src
-cd ~/embodied_ws/src
-# copy this repo's `src/embodied_mvp` here
+# copy this repo's src/embodied_mvp into ~/embodied_ws/src/
 cd ~/embodied_ws
-colcon build --symlink-install
+colcon build --packages-select embodied_mvp
 source install/setup.bash
+```
+
+Each new shell on the Pi:
+```bash
+conda activate ros_env
+source ~/embodied_ws/install/setup.bash
+```
+
+## Laptop setup (Windows, Python 3.11, RTX 4060)
+
+```powershell
+pip install ultralytics opencv-python requests numpy pyyaml python-telegram-bot
+pip install pupil-apriltags          # only needed for --slam
+# CUDA build of PyTorch (replace cu124 to match your driver):
+pip uninstall -y torch torchvision
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+```
+
+Telegram bot config (one-time):
+```powershell
+cd laptop
+Copy-Item telegram_bot_config.example.txt telegram_bot_config.txt
+# Edit telegram_bot_config.txt — BOT_TOKEN, PI_IP, AUTHORIZED_IDS.
+# This file is gitignored; never commit it.
 ```
 
 ## Run
 
+### MVP autonomous search only
+
 ```bash
-source ~/embodied_ws/install/setup.bash
+# Pi
 ros2 launch embodied_mvp mvp.launch.py target_class:=chair
 ```
-
-Stop motors only (debug detection without driving):
-```bash
-ros2 launch embodied_mvp mvp.launch.py enable_search:=false
-ros2 run rqt_image_view rqt_image_view /detections/image_annotated
+```powershell
+# Laptop (separate machine)
+cd laptop
+python laptop_detector.py --pi 172.20.10.4
 ```
 
-Manual teleop:
-```bash
-ros2 launch embodied_mvp mvp.launch.py enable_yolo:=false enable_search:=false
-ros2 run teleop_twist_keyboard teleop_twist_keyboard
+### Add phone control
+
+```powershell
+# Laptop, additional terminal
+cd laptop
+python telegram_bot.py
 ```
 
-## Hardware bring-up checklist (Day 1)
+Then message your bot from the phone. Commands (Chinese / English):
 
-Before flipping backends from `mock` to real, confirm:
+- Motion: `前进` / `后退` / `左移` / `右移` / `左转` / `右转` / `停`
+  - Optional duration: `前进3秒`, `back 5s` (capped at 30 s).
+- Photo: `拍照`, `旋转拍照`.
+- Search: `去找椅子`, `find bottle` — `agent_node` switches to SEARCH and reports `arrived:<class>` when stopped.
+- Map: `地图` — top-down semantic map PNG (requires `--slam`).
 
-| Item | What to find | Param to set |
-|------|--------------|--------------|
-| Motor protocol | UART text / I2C / PCA9685 + GPIO direction | `motor_node.backend`, `serial_port` |
-| Wheelbase | measure half-distances (m) | `wheel_base_lx`, `wheel_base_ly` |
-| IR sensor | digital binary / analog (ADC) / I2C / UART | `ir_node.backend` |
-| Servo board | PCA9685 I2C address (0x40 default) | `pantilt_node.i2c_address` |
-| Servo pulse range | check servo datasheet (us_min/us_max) | `pantilt_node.us_min/us_max` |
+### Add semantic SLAM
 
-## NCNN speedup (when ultralytics too slow on Pi5)
+```bash
+# Pi — same launch with the map node enabled
+ros2 launch embodied_mvp mvp.launch.py enable_semantic_map:=true
+```
+```powershell
+# Laptop — detector with SLAM, recommended tuning
+python laptop_detector.py --pi 172.20.10.4 --slam `
+  --cam-height 0.15 `
+  --conf 0.5 `
+  --gate-radius 0.8 `
+  --tentative-stale-sec 60 `
+  --confirm-min-obs 3 `
+  --miss-prune 12
+```
+`--cam-height` is the camera's height above the floor (m) with pan-tilt at
+zero — measure it; the default 0.15 matches this kit. Ground-plane object
+placement is sensitive to this value.
+
+### View the map
+
+- Browser: <http://127.0.0.1:8091/map.png> (laptop) — top-down PNG.
+- Telegram: send `地图`.
+- RViz2 (Pi desktop or VNC): Fixed Frame `map`; subscribe `MarkerArray`
+  topic `/semantic_map/markers`.
+- Pi camera live: <http://172.20.10.4:8080/> (MJPEG).
+- Annotated YOLO frame: <http://127.0.0.1:8090/annotated>.
+
+### Stop everything
+
+`Ctrl+C` in each window. Press `q` in the laptop detector preview.
+
+## Semantic SLAM bring-up (one-time room prep)
+
+1. **Generate printable targets:**
+   ```powershell
+   cd laptop
+   python -m slam.make_targets --tags 0-7
+   ```
+   PNGs land in `laptop/slam/print_targets/`.
+
+2. **Camera calibration** (run with the Pi camera stack up):
+   ```powershell
+   # capture 15-20 chessboard shots
+   python -m slam.camera_calib capture --url http://172.20.10.4:8080/snapshot --out calib_shots
+   # compute intrinsics, dropping bad views
+   python -m slam.camera_calib calibrate --images calib_shots --square-m <measured_square_size> --max-view-error 0.8
+   ```
+   Target RMS < 0.5 px. Output overwrites
+   [`laptop/slam/camera_intrinsics.yaml`](laptop/slam/camera_intrinsics.yaml).
+
+3. **Place + measure AprilTags:**
+   - Print `tag36h11_id0..N.png`, mount on hard board, fix to walls.
+   - Tags must not move afterwards.
+   - Measure each tag's `x, y, z, yaw_deg, size_m`. Tag 0 is the map origin.
+   - Write the real values to `laptop/slam/tag_map.local.yaml` (gitignored).
+     The tracked [`tag_map.yaml`](laptop/slam/tag_map.yaml) is a template only;
+     `load_tag_map()` automatically prefers `.local` if present.
+
+## Topic map
+
+| Topic | Type | Direction |
+|-------|------|-----------|
+| `/camera/image_raw` | sensor_msgs/Image | csi_camera → yolo / mjpeg |
+| `/detections` | vision_msgs/Detection2DArray | det_bridge → agent |
+| `/ir/range` | sensor_msgs/Range | ir_node → agent |
+| `/ir/left`, `/ir/right` | std_msgs/Bool | side_ir → agent |
+| `/cmd_vel` | geometry_msgs/Twist | agent → motor |
+| `/pantilt/cmd` | geometry_msgs/Vector3 | agent → pantilt / mjpeg headers |
+| `/semantic_map/markers` | visualization_msgs/MarkerArray | semantic_map_node → RViz |
+| TF `map → base_link → camera` | tf2 | semantic_map_node |
+
+## HTTP endpoints
+
+| URL | Server | Purpose |
+|-----|--------|---------|
+| `http://<pi>:8080/` | `mjpeg_node` | MJPEG stream (browser) |
+| `http://<pi>:8080/snapshot` | `mjpeg_node` | latest JPEG + `X-Pan-Yaw` / `X-Pan-Tilt` headers |
+| `http://<pi>:9090/detections` | `det_bridge_node` | POST detections from laptop |
+| `http://<pi>:9091/command` | `agent_node` | POST commands from telegram_bot |
+| `http://<pi>:9091/status` | `agent_node` | GET mode / event (telegram_bot polls) |
+| `http://<pi>:9092/map` | `semantic_map_node` | POST semantic map from laptop |
+| `http://<laptop>:8090/annotated` | `laptop_detector.py` | latest YOLO-boxed JPEG |
+| `http://<laptop>:8091/map.png` | `laptop_detector.py --slam` | top-down semantic map PNG |
+
+## Hardware bring-up checklist
+
+Confirm before flipping any backend from `mock` to real in `params.yaml`:
+
+| Item | Find | Param |
+|------|------|-------|
+| Motor protocol | UART / I2C / PCA9685 + GPIO direction | `motor_node.backend`, `serial_port` |
+| Wheelbase | half-distances (m) | `wheel_base_lx`, `wheel_base_ly` |
+| Ultrasonic pins | GPIO trigger / echo | `ir_node.trigger_pin`, `echo_pin` |
+| Side IR pins | left / right GPIO | `side_ir_node.left_pin`, `right_pin` |
+| Servo board | PCA9685 I2C address | `pantilt_node.i2c_address` |
+| Servo channels | pan / tilt PWM channels | `pantilt_node.pan_channel`, `tilt_channel` |
+| Camera height | measure mount to floor (m) | `laptop_detector.py --cam-height` |
+
+## NCNN speedup (Pi-side YOLO fallback)
+
+When the laptop is unavailable and you must run YOLO on the Pi:
 
 On the laptop:
 ```bash
-pip install ultralytics
 yolo export model=yolov8n.pt format=ncnn imgsz=320 int8=True
-# scp yolov8n_ncnn_model/  pi@<pi-ip>:~/embodied_ws/
+# scp yolov8n_ncnn_model/ pi@<pi-ip>:~/embodied_ws/
 ```
-
-On Pi5, set in `params.yaml`:
+In Pi `params.yaml`:
 ```yaml
 yolo_node:
   ros__parameters:
     backend: ncnn
     model_path: /home/pi/embodied_ws/yolov8n_ncnn_model
 ```
-
-## Topic map
-
-| Topic | Type | Direction |
-|-------|------|-----------|
-| `/camera/image_raw` | sensor_msgs/Image | camera → yolo |
-| `/detections` | vision_msgs/Detection2DArray | yolo → search |
-| `/detections/image_annotated` | sensor_msgs/Image | yolo → rviz2 |
-| `/ir/range` | sensor_msgs/Range | ir → search |
-| `/cmd_vel` | geometry_msgs/Twist | search → motor |
-| `/pantilt/cmd` | geometry_msgs/Vector3 | search → pantilt |
+Then `enable_yolo:=true enable_bridge:=false` in the launch.
+Warning: on-Pi YOLO can pin the CPU and trip the motor-battery BMS — keep
+detection on the laptop in normal operation.
 
 ## End-to-end verification (room test)
 
-1. Place a chair 2-3 m from car
-2. `ros2 launch embodied_mvp mvp.launch.py target_class:=chair`
-3. Expect: rotate → spot chair → drive forward, recentering → IR < 0.4 m → stop, log `Found chair!`
+1. Place a chair 2-3 m from the car.
+2. Pi: `ros2 launch embodied_mvp mvp.launch.py target_class:=chair`
+3. Laptop: `python laptop_detector.py --pi 172.20.10.4`
+4. Expect: rotate → spot chair → discrete forward pulses, recentering → bbox
+   height ≥ `arrived_height_ratio` (or IR < `stop_distance_m`) → stop, log
+   `Found chair!`, Telegram receives `arrived:chair`.
 
-Failure modes and tuning are listed in the plan file.
+For mapping verification see the semantic-SLAM phase plan in
+[`docs/CONTEXT.md`](docs/CONTEXT.md).
 
-## Phone control (Telegram)
+## Security notes
 
-Run YOLO offload as usual (`laptop_detector.py`), plus the bot:
-
-1. Create a bot via @BotFather, get the token.
-2. Edit `laptop/telegram_bot.py` — set `BOT_TOKEN`, `PI_IP`, `AUTHORIZED_IDS`.
-3. `pip install python-telegram-bot requests`
-4. `python laptop/telegram_bot.py`
-
-Commands (Chinese): 前进 / 后退 / 左移 / 右移 / 左转 / 右转 / 停 /
-拍照 / 旋转拍照 / 去找<目标>（瓶子、椅子、人 ...）.
-
-`agent_node` on the Pi receives commands on port 9091 and is the sole
-/cmd_vel owner (modes: IDLE / MANUAL / SEARCH / ROTATE_PHOTO).
+- `laptop/telegram_bot_config.txt` is gitignored — keep the bot token,
+  authorized user IDs, and Pi IP there. **Never commit them.**
+- `laptop/slam/tag_map.local.yaml` is gitignored — keep real room geometry
+  there. The tracked `tag_map.yaml` is a template only.
+- The Pi HTTP endpoints (`:9090`, `:9091`, `:9092`) are unauthenticated;
+  do not expose the Pi to untrusted networks.
 
 ## TODO
 
-- **Wire up side-IR obstacle avoidance.** The left/right binary IR sensors
-  (GPIO 12/16) are read into `obs_left` / `obs_right` and published on
-  `/ir/left` `/ir/right`, but no behavior currently uses them — the
-  avoidance logic was dropped when APPROACHING was rewritten to discrete
-  pulses. Today the robot only *appears* to avoid obstacles: the visual
-  servo steers toward the target bbox and the path curves past obstacles
-  incidentally. An obstacle that directly blocks the path or hides the
-  target can stall or collide the robot. Add active avoidance in the
-  SEARCH/APPROACHING tick: on a side-IR hit, steer away before the next
-  forward pulse. Params `side_ir_enabled` and `avoid_yaw_bias` already exist.
+- **Wire up side-IR obstacle avoidance.** Left/right binary IR
+  (`/ir/left`, `/ir/right`) are read but no behavior consumes them — avoidance
+  logic was dropped when APPROACHING was rewritten to discrete pulses. The
+  robot only *appears* to avoid obstacles because the visual servo path
+  curves past them incidentally. Params `side_ir_enabled` and
+  `avoid_yaw_bias` already exist for the eventual re-implementation.
+- **Dead-reckoning between tag observations.** When no AprilTag is visible
+  the robot pose freezes (documented limitation — no encoders, no IMU).
+  Integrating commanded `/cmd_vel` would buy a few seconds of plausible
+  extrapolation; cheap to add but accuracy will degrade quickly.
+- **Auto-built tag pose graph.** Today tag positions are hand-measured.
+  Auto-solving the tag layout from co-visible observations would remove
+  the manual measurement step at the cost of some drift.

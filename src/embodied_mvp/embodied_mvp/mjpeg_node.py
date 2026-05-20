@@ -3,6 +3,11 @@ multipart MJPEG so any browser (no ROS client needed) can view it live.
 
 View on laptop:  http://<pi-ip>:8080/
 
+GET /snapshot also carries the current pan-tilt angles as the response headers
+``X-Pan-Yaw`` and ``X-Pan-Tilt`` (radians). The laptop semantic-SLAM detector
+reads them so it knows the camera orientation for the frame it just pulled —
+one fetch, no separate endpoint, angles co-temporal with the frame.
+
 Params:
   topic   : image topic to stream (default /detections/image_annotated)
   port    : HTTP port (default 8080)
@@ -17,6 +22,7 @@ import cv2
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
+from geometry_msgs.msg import Vector3
 from cv_bridge import CvBridge
 
 
@@ -37,8 +43,13 @@ class MjpegNode(Node):
         self.bridge = CvBridge()
         self.lock = threading.Lock()
         self.latest = None  # latest JPEG bytes
+        # latest pan-tilt command (radians) — reported in /snapshot headers so
+        # the laptop knows the camera orientation for each frame it pulls.
+        self.pan_yaw = 0.0
+        self.pan_tilt = 0.0
 
         self.create_subscription(Image, self.topic, self.on_image, 5)
+        self.create_subscription(Vector3, '/pantilt/cmd', self.on_pantilt, 5)
         self._start_http()
         self.get_logger().info(
             f'mjpeg_node streaming "{self.topic}" at http://0.0.0.0:{self.port}/')
@@ -55,6 +66,11 @@ class MjpegNode(Node):
             with self.lock:
                 self.latest = jpg.tobytes()
 
+    def on_pantilt(self, msg: Vector3):
+        with self.lock:
+            self.pan_yaw = float(msg.x)
+            self.pan_tilt = float(msg.y)
+
     def _start_http(self):
         node = self
 
@@ -67,6 +83,7 @@ class MjpegNode(Node):
                 # is no stream pipe to buffer up -> minimal latency.
                 with node.lock:
                     jpg = node.latest
+                    yaw, tilt = node.pan_yaw, node.pan_tilt
                 if jpg is None:
                     self.send_response(503)
                     self.end_headers()
@@ -75,6 +92,8 @@ class MjpegNode(Node):
                 self.send_header('Content-Type', 'image/jpeg')
                 self.send_header('Content-Length', str(len(jpg)))
                 self.send_header('Cache-Control', 'no-cache')
+                self.send_header('X-Pan-Yaw', f'{yaw:.6f}')
+                self.send_header('X-Pan-Tilt', f'{tilt:.6f}')
                 self.end_headers()
                 try:
                     self.wfile.write(jpg)
