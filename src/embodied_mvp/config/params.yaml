@@ -44,11 +44,11 @@ ir_node:
 
 side_ir_node:
   ros__parameters:
-    backend: mock               # mock | gpio (Makerobo binary IR)
-    # NOTE: side IR is physically UNWIRED. With backend=gpio the floating
-    # GPIO pins read noise -> obs_left/obs_right stuck True -> NAV mode
-    # reports blocked immediately. Keep `mock` until the sensors are wired;
-    # then switch back to `gpio`.
+    backend: gpio               # mock | gpio (Makerobo binary IR)
+    # If NAV reports `blocked` immediately with nothing in the way, the IR
+    # modules' sensitivity pots are set too high (they detect the floor /
+    # ambient) — turn the pot down until the signal LED goes off in clear
+    # space. `mock` disables side IR entirely as a fallback.
     rate_hz: 10.0
     left_pin: 12
     right_pin: 16
