@@ -36,7 +36,7 @@ class NavConfig:
     # (stays still) so the detector gets several sharp frames to spot a tag.
     scan_max_rotations: int = 12
     scan_rotate_rad: float = math.pi / 6          # 30 deg per scan pulse
-    scan_dwell_sec: float = 1.2                   # still time after each step
+    scan_dwell_sec: float = 2.0                   # still time after each step
     # a blocked:front within this map distance of the goal is read as the
     # goal object itself (arrival), not an obstacle to avoid. Larger than
     # arrived_radius because the ultrasonic trips on the object SURFACE while
