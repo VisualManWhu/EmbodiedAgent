@@ -32,9 +32,11 @@ class NavConfig:
     block_retries: int = 3
     # scan recovery: small steps so a tag is not skipped between two stops.
     # 12 x 30 deg = a full 360 deg sweep, stopping often enough to land with
-    # a tag inside the camera FOV.
+    # a tag inside the camera FOV. After each rotation the robot dwells
+    # (stays still) so the detector gets several sharp frames to spot a tag.
     scan_max_rotations: int = 12
     scan_rotate_rad: float = math.pi / 6          # 30 deg per scan pulse
+    scan_dwell_sec: float = 1.2                   # still time after each step
 
 
 @dataclass
@@ -59,6 +61,7 @@ class NavSession:
     fail_reason: str | None = None
     last_tag_t: float | None = None
     _scan_start_t: float | None = None
+    _scan_resume_t: float | None = None
 
     def on_tag_fix(self, t: float):
         """Record that a tag-fix arrived at time ``t``.
@@ -70,6 +73,7 @@ class NavSession:
         self.last_tag_t = float(t)
         self.scan_count = 0
         self._scan_start_t = None
+        self._scan_resume_t = None
         if self.state is State.SCANNING:
             self.state = State.DRIVING
 
@@ -130,6 +134,7 @@ class NavSession:
             self.state = State.DRIVING
             self.scan_count = 0
             self._scan_start_t = None
+            self._scan_resume_t = None
 
         x, y, yaw = robot_pose
         dx, dy = self.goal_xy[0] - x, self.goal_xy[1] - y
@@ -156,11 +161,19 @@ class NavSession:
             self.state = State.FAILED
             self.fail_reason = 'lost'
             return None
+        # Dwell after a scan rotation: stay still until _scan_resume_t so the
+        # detector gets sharp, blur-free frames to spot a tag before rotating
+        # again. Returning None keeps the robot idle this tick.
+        if self._scan_resume_t is not None and now < self._scan_resume_t:
+            self.state = State.SCANNING
+            return None
         if self._scan_start_t is None:
             self._scan_start_t = now
         self.scan_count += 1
-        self.state = State.SCANNING
         sec = self.config.scan_rotate_rad / self.config.w_max
+        # next scan step only after this rotation finishes AND the dwell.
+        self._scan_resume_t = now + sec + self.config.scan_dwell_sec
+        self.state = State.WAITING_PULSE
         return NavCommand(0.0, 0.0, self.config.w_max, sec, 'scan_rotate')
 
 

@@ -115,12 +115,28 @@ def test_scan_when_pose_stale_and_no_tag():
 def test_scan_exhausted_fails():
     s = _sess(scan_max_rotations=2)
     s.on_tag_fix(t=0.0)
-    for i in range(2):
-        s.tick((0.0, 0.0, 0.0), 10.0 + i, pose_stale=True)
+    t = 10.0
+    for _ in range(2):
+        cmd = s.tick((0.0, 0.0, 0.0), t, pose_stale=True)
+        assert cmd.kind == 'scan_rotate'
         s.on_pi_event('pulse_done')
-    s.tick((0.0, 0.0, 0.0), 20.0, pose_stale=True)
+        t += 10.0                          # advance well past the scan dwell
+    s.tick((0.0, 0.0, 0.0), t, pose_stale=True)
     assert s.state is State.FAILED
     assert s.fail_reason == 'lost'
+
+
+def test_scan_dwell_holds_between_rotations():
+    """A scan rotation is followed by a still dwell — a tick inside the dwell
+    window issues no new pulse so the detector can grab clean frames."""
+    s = _sess(scan_max_rotations=12)
+    s.on_tag_fix(t=0.0)
+    cmd = s.tick((0.0, 0.0, 0.0), 10.0, pose_stale=True)
+    assert cmd.kind == 'scan_rotate'
+    s.on_pi_event('pulse_done')
+    # a tick shortly after the pulse, still inside the dwell -> no command
+    assert s.tick((0.0, 0.0, 0.0), 10.5, pose_stale=True) is None
+    assert s.scan_count == 1
 
 
 def test_tag_fix_during_scan_resumes_drive():
@@ -138,19 +154,22 @@ def test_scan_count_clears_after_tag_recovery():
     scanning from scan_count=0, not from where the previous scan left off."""
     s = _sess(scan_max_rotations=3)
     s.on_tag_fix(t=0.0)
-    # first lost period: 2 scan pulses then tag found
+    # first lost period: 2 scan pulses then tag found (advance past each dwell)
     s.tick((0.0, 0.0, 0.0), 10.0, pose_stale=True)
     s.on_pi_event('pulse_done')
-    s.tick((0.0, 0.0, 0.0), 11.0, pose_stale=True)
+    s.tick((0.0, 0.0, 0.0), 20.0, pose_stale=True)
     s.on_pi_event('pulse_done')
     assert s.scan_count == 2
-    s.on_tag_fix(t=12.0)
+    s.on_tag_fix(t=22.0)
     assert s.scan_count == 0
     # second lost period: should get its full budget of 3 pulses again
-    for i in range(3):
-        s.tick((0.0, 0.0, 0.0), 20.0 + i, pose_stale=True)
+    t = 30.0
+    for _ in range(3):
+        cmd = s.tick((0.0, 0.0, 0.0), t, pose_stale=True)
+        assert cmd.kind == 'scan_rotate'
         s.on_pi_event('pulse_done')
-    # 4th tick exhausts -> FAILED('lost')
-    s.tick((0.0, 0.0, 0.0), 25.0, pose_stale=True)
+        t += 10.0
+    # next tick exhausts -> FAILED('lost')
+    s.tick((0.0, 0.0, 0.0), t, pose_stale=True)
     assert s.state is State.FAILED
     assert s.fail_reason == 'lost'
