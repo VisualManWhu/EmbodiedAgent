@@ -513,18 +513,23 @@ class AgentNode(Node):
         if self.ir_range < self.stop_d:
             self.publish_full_cmd(0.0, 0.0, 0.0)
             self.cmd_server.post_event('blocked:front')
+            self.get_logger().warn(
+                f'NAV blocked:front  ir_range={self.ir_range:.2f} '
+                f'< stop_d={self.stop_d:.2f}')
             self.nav_blocked = True
             self.mode = 'IDLE'
             return
         if self.side_ir_enabled and self.obs_left:
             self.publish_full_cmd(0.0, 0.0, 0.0)
             self.cmd_server.post_event('blocked:left')
+            self.get_logger().warn('NAV blocked:left  obs_left=True')
             self.nav_blocked = True
             self.mode = 'IDLE'
             return
         if self.side_ir_enabled and self.obs_right:
             self.publish_full_cmd(0.0, 0.0, 0.0)
             self.cmd_server.post_event('blocked:right')
+            self.get_logger().warn('NAV blocked:right  obs_right=True')
             self.nav_blocked = True
             self.mode = 'IDLE'
             return
