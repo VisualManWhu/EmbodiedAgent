@@ -143,15 +143,16 @@ class NavSession:
             return None
         if self.state is State.WAITING_PULSE:
             return None
-        if robot_pose is None:
-            return None
 
         if self.queued:
             cmd = self.queued.pop(0)
             self.state = State.WAITING_PULSE
             return cmd
 
-        if pose_stale:
+        # No pose at all (never localized, e.g. NAV started with no tag in
+        # view) OR a stale extrapolated pose -> rotate-scan to acquire a tag
+        # rather than hang in INIT until the caller times out.
+        if robot_pose is None or pose_stale:
             return self._scan_tick(now)
 
         # fresh pose -> normal drive

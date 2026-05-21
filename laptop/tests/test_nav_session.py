@@ -134,6 +134,15 @@ def test_block_count_resets_on_clean_pulse():
     assert s.block_count == 0
 
 
+def test_scan_when_no_pose_at_start():
+    """NAV started with no localization at all (robot_pose is None) must
+    rotate-scan to acquire a tag, not hang in INIT."""
+    s = _sess(scan_max_rotations=12)
+    cmd = s.tick(robot_pose=None, now=0.0)
+    assert cmd is not None
+    assert cmd.kind == 'scan_rotate'
+
+
 def test_scan_when_pose_stale_and_no_tag():
     s = _sess(scan_max_rotations=4)
     s.on_tag_fix(t=0.0)
