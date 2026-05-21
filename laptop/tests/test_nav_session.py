@@ -82,6 +82,38 @@ def test_blocked_strafes_away_per_side():
     assert cmd.vy > 0, f'blocked:right should strafe left (vy>0), got vy={cmd.vy}'
 
 
+def test_blocked_front_near_goal_is_arrival():
+    """blocked:front within blocked_arrival_dist of the goal is the goal
+    object itself — ARRIVED, not an obstacle. The robot is past the arrival
+    radius (tick did not already arrive) but close enough."""
+    s = _sess(goal=(2.0, 0.0), arrived_radius_m=0.4,
+              blocked_arrival_dist_m=1.0)
+    cmd = s.tick((1.3, 0.0, 0.0), 0.0)       # 0.7 m out: not arrived, drives
+    assert cmd.kind == 'forward'
+    s.on_pi_event('blocked:front')           # ultrasonic trips on the object
+    assert s.state is State.ARRIVED
+
+
+def test_blocked_front_with_target_ahead_is_arrival():
+    """blocked:front while the camera sees the goal class close ahead is an
+    arrival even if the map distance is still large."""
+    s = _sess(goal=(5.0, 0.0))
+    s.tick((0.0, 0.0, 0.0), 0.0, target_ahead=True)
+    s.on_pi_event('blocked:front')
+    assert s.state is State.ARRIVED
+
+
+def test_blocked_front_far_from_goal_is_obstacle():
+    """blocked:front far from the goal with no target in view -> obstacle ->
+    avoidance side-step, not arrival."""
+    s = _sess(goal=(5.0, 0.0), blocked_arrival_dist_m=1.0)
+    s.tick((0.0, 0.0, 0.0), 0.0, target_ahead=False)
+    s.on_pi_event('blocked:front')
+    assert s.state is not State.ARRIVED
+    cmd = s.tick((0.0, 0.0, 0.0), 0.1)
+    assert cmd.kind == 'strafe'
+
+
 def test_three_blocks_fail():
     s = _sess(block_retries=3)
     for _ in range(3):

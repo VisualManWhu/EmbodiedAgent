@@ -114,6 +114,7 @@ agent_node:
     search_rotate_sec: 0.5         # stop-and-scan: rotate burst length
     search_dwell_sec: 1.3          # stop-and-scan: still dwell for clean frames
     stop_distance_m: 0.4
+    nav_obstacle_dist_m: 0.2      # NAV mode: front ultrasonic block threshold
     arrived_height_ratio: 0.75    # bbox height / frame height -> stop (vision distance, sonar-independent)
     det_conf_min: 0.4             # drop low-confidence detections (avoid misclassification flicker)
     confirm_frames: 2             # (unused — lock is now time-windowed)

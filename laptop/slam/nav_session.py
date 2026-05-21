@@ -37,6 +37,11 @@ class NavConfig:
     scan_max_rotations: int = 12
     scan_rotate_rad: float = math.pi / 6          # 30 deg per scan pulse
     scan_dwell_sec: float = 1.2                   # still time after each step
+    # a blocked:front within this map distance of the goal is read as the
+    # goal object itself (arrival), not an obstacle to avoid. Larger than
+    # arrived_radius because the ultrasonic trips on the object SURFACE while
+    # the goal landmark is its CENTRE.
+    blocked_arrival_dist_m: float = 1.0
 
 
 @dataclass
@@ -62,6 +67,9 @@ class NavSession:
     last_tag_t: float | None = None
     _scan_start_t: float | None = None
     _scan_resume_t: float | None = None
+    # obstacle-vs-target discrimination for a blocked:front event
+    _target_ahead: bool = False              # camera sees the goal class close
+    _last_goal_dist: float = float('inf')    # map distance at the last tick
 
     def on_tag_fix(self, t: float):
         """Record that a tag-fix arrived at time ``t``.
@@ -88,7 +96,17 @@ class NavSession:
             if not self.queued:
                 self.block_count = 0
         elif event.startswith('blocked:'):
-            self._handle_blocked(event.split(':', 1)[1])
+            side = event.split(':', 1)[1]
+            # A front block on the goal itself is an arrival, not an obstacle:
+            # treat it as ARRIVED when the camera sees the goal class close
+            # ahead, or the map puts us near the goal landmark.
+            if side == 'front' and (
+                    self._target_ahead
+                    or self._last_goal_dist
+                    < self.config.blocked_arrival_dist_m):
+                self.state = State.ARRIVED
+                return
+            self._handle_blocked(side)
 
     def _handle_blocked(self, side: str):
         self.block_count += 1
@@ -112,8 +130,15 @@ class NavSession:
                                       'forward'))
         self.state = State.DRIVING
 
-    def tick(self, robot_pose, now: float, pose_stale: bool = False):
-        """Produce the next motion pulse, or None if nothing to send."""
+    def tick(self, robot_pose, now: float, pose_stale: bool = False,
+             target_ahead: bool = False):
+        """Produce the next motion pulse, or None if nothing to send.
+
+        ``target_ahead`` — the camera currently sees the goal's object class
+        large and centred (i.e. the thing right in front is the target).
+        Used to tell an arrival apart from an obstacle on a blocked:front.
+        """
+        self._target_ahead = target_ahead
         if self.state in (State.ARRIVED, State.FAILED):
             return None
         if self.state is State.WAITING_PULSE:
@@ -139,6 +164,7 @@ class NavSession:
         x, y, yaw = robot_pose
         dx, dy = self.goal_xy[0] - x, self.goal_xy[1] - y
         dist = math.hypot(dx, dy)
+        self._last_goal_dist = dist
         if dist < self.config.arrived_radius_m:
             self.state = State.ARRIVED
             return NavCommand(0.0, 0.0, 0.0, 0.0, 'stop')

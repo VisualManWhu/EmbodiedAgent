@@ -61,6 +61,7 @@ class AgentNode(Node):
         self.declare_parameter('approach_steer_gain', 0.0012)# forward-pulse steering gain (rad/s per px)
         self.declare_parameter('approach_steer_max', 0.22)   # cap on forward-pulse steering
         self.declare_parameter('stop_distance_m', 0.4)
+        self.declare_parameter('nav_obstacle_dist_m', 0.2)  # NAV front-block threshold
         self.declare_parameter('arrived_height_ratio', 0.55)  # bbox height / image height -> "close enough"
         self.declare_parameter('det_conf_min', 0.4)
         self.declare_parameter('confirm_frames', 3)
@@ -109,6 +110,7 @@ class AgentNode(Node):
         self.steer_gain = p('approach_steer_gain').value
         self.steer_max = p('approach_steer_max').value
         self.stop_d = p('stop_distance_m').value
+        self.nav_obstacle_d = p('nav_obstacle_dist_m').value
         self.arrived_h_ratio = p('arrived_height_ratio').value
         self.conf_min = p('det_conf_min').value
         self.confirm_n = int(p('confirm_frames').value)
@@ -509,13 +511,15 @@ class AgentNode(Node):
                 self.cmd_server.post_event('pulse_done')
             self.mode = 'IDLE'
             return
-        # obstacle checks — abort the pulse, post a typed event
-        if self.ir_range < self.stop_d:
+        # obstacle checks — abort the pulse, post a typed event. NAV uses its
+        # own (tighter) threshold so the robot can close right up to a goal
+        # object; the laptop NavSession decides arrival-vs-obstacle.
+        if self.ir_range < self.nav_obstacle_d:
             self.publish_full_cmd(0.0, 0.0, 0.0)
             self.cmd_server.post_event('blocked:front')
             self.get_logger().warn(
                 f'NAV blocked:front  ir_range={self.ir_range:.2f} '
-                f'< stop_d={self.stop_d:.2f}')
+                f'< nav_obstacle_d={self.nav_obstacle_d:.2f}')
             self.nav_blocked = True
             self.mode = 'IDLE'
             return

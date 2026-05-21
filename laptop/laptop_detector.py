@@ -215,7 +215,9 @@ class SlamRunner:
                 robot_pose, pose_stale = (rx, ry, ryaw), False
             else:
                 robot_pose, pose_stale = self.dead_reckoner.pose_at(now)
-            cmd = self.session_nav.tick(robot_pose, now, pose_stale=pose_stale)
+            target_ahead = self._target_seen_ahead(detections, frame.shape)
+            cmd = self.session_nav.tick(robot_pose, now, pose_stale=pose_stale,
+                                        target_ahead=target_ahead)
             if cmd is not None and cmd.kind != 'stop':
                 self._send_nav(cmd, now)
             self._drain_pi_events()
@@ -228,6 +230,22 @@ class SlamRunner:
             if self.session_nav is not None:
                 nav_status = self.session_nav.state.value
         return len(tag_dets), located, nav_status
+
+    def _target_seen_ahead(self, detections, frame_shape):
+        """True if YOLO currently sees the active goal's object class large
+        and centred — i.e. the thing right in front is the goal, not an
+        obstacle. Returns False for tag goals (no COCO class to match)."""
+        if self.session_nav is None or not self.session_nav.goal_label:
+            return False
+        h, w = frame_shape[:2]
+        for d in detections:
+            if d['cls'] != self.session_nav.goal_label:
+                continue
+            cx_frac = d['cx'] / w
+            h_frac = d['h'] / h
+            if 0.30 < cx_frac < 0.70 and h_frac > 0.40:
+                return True
+        return False
 
     def _render(self):
         robot = self.last_robot
