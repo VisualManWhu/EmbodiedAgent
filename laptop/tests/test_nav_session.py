@@ -31,7 +31,19 @@ def test_drives_forward_when_heading_ok():
     cmd = s.tick(robot_pose=(0.0, 0.0, 0.0), now=0.0)
     assert cmd.kind == 'forward'
     assert cmd.vx > 0
-    assert cmd.wz == 0.0
+    assert cmd.wz == 0.0                          # dead-on -> no steering
+
+
+def test_forward_pulse_blends_steering_when_slightly_off():
+    """A small heading error (within heading_tol) drives forward but blends
+    in proportional steering toward the goal — no drift-then-snap."""
+    s = _sess(goal=(2.0, 0.0), heading_tol_rad=0.15)
+    # goal dead ahead in +x, robot yawed +0.1 rad: heading_err = -0.1 (<tol)
+    cmd = s.tick(robot_pose=(0.0, 0.0, 0.1), now=0.0)
+    assert cmd.kind == 'forward'
+    assert cmd.vx > 0
+    assert cmd.wz < 0                             # steers back toward the line
+    assert abs(cmd.wz) <= 0.25                    # capped by forward_steer_max
 
 
 def test_no_command_while_waiting_for_pulse():

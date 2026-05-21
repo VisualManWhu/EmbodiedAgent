@@ -21,11 +21,15 @@ class State(str, Enum):
 @dataclass
 class NavConfig:
     arrived_radius_m: float = 0.4
-    heading_tol_rad: float = 0.35
+    heading_tol_rad: float = 0.15            # >this -> dedicated rotate pulse
     v_max: float = 0.15
     w_max: float = 0.4
     max_pulse_sec: float = 1.5
     min_pulse_sec: float = 0.2
+    # forward pulses blend in proportional steering so the robot curves onto
+    # the goal line instead of drifting off and snap-correcting later.
+    steer_gain: float = 1.5                  # wz per rad of heading error
+    forward_steer_max: float = 0.25          # cap on the blended wz (rad/s)
     strafe_speed: float = 0.15
     strafe_seconds: float = 0.6
     avoid_forward_seconds: float = 0.8
@@ -172,16 +176,23 @@ class NavSession:
 
         heading_err = _wrap(math.atan2(dy, dx) - yaw)
         if abs(heading_err) > self.config.heading_tol_rad:
+            # large error -> dedicated in-place rotate to face the goal
             wz = self.config.w_max * (1.0 if heading_err > 0 else -1.0)
             sec = _clamp(abs(heading_err) / self.config.w_max,
                          self.config.min_pulse_sec, self.config.max_pulse_sec)
             self.state = State.WAITING_PULSE
             return NavCommand(0.0, 0.0, wz, sec, 'rotate')
 
+        # roughly aimed -> drive forward, blending in proportional steering so
+        # the heading self-corrects along the way (curve onto the goal line,
+        # no drift-then-snap zigzag).
         sec = _clamp(dist / self.config.v_max,
                      self.config.min_pulse_sec, self.config.max_pulse_sec)
+        wz = _clamp(self.config.steer_gain * heading_err,
+                    -self.config.forward_steer_max,
+                    self.config.forward_steer_max)
         self.state = State.WAITING_PULSE
-        return NavCommand(self.config.v_max, 0.0, 0.0, sec, 'forward')
+        return NavCommand(self.config.v_max, 0.0, wz, sec, 'forward')
 
     def _scan_tick(self, now: float):
         if self.scan_count >= self.config.scan_max_rotations:
