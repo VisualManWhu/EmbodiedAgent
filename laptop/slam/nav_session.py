@@ -30,8 +30,11 @@ class NavConfig:
     strafe_seconds: float = 0.6
     avoid_forward_seconds: float = 0.8
     block_retries: int = 3
-    scan_max_rotations: int = 4
-    scan_rotate_rad: float = math.pi / 2          # 90 deg per scan pulse
+    # scan recovery: small steps so a tag is not skipped between two stops.
+    # 12 x 30 deg = a full 360 deg sweep, stopping often enough to land with
+    # a tag inside the camera FOV.
+    scan_max_rotations: int = 12
+    scan_rotate_rad: float = math.pi / 6          # 30 deg per scan pulse
 
 
 @dataclass
