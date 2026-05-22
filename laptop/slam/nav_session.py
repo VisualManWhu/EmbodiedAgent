@@ -42,6 +42,9 @@ class NavConfig:
     strafe_seconds: float = 0.6
     avoid_forward_seconds: float = 0.8
     block_retries: int = 3
+    # after block_retries side-steps fail, don't give up: back up and re-plan.
+    recovery_backup_sec: float = 2.0         # reverse duration per recovery
+    max_recovery_cycles: int = 5             # outer bound -> finally FAILED
     # scan recovery: small steps so a tag is not skipped between two stops.
     # 12 x 30 deg = a full 360 deg sweep, stopping often enough to land with
     # a tag inside the camera FOV. After each rotation the robot dwells
@@ -73,9 +76,11 @@ class NavSession:
     config: NavConfig = field(default_factory=NavConfig)
     state: State = State.INIT
     block_count: int = 0
+    recovery_count: int = 0
     scan_count: int = 0
     queued: list = field(default_factory=list)
     fail_reason: str | None = None
+    _recovery_pending: bool = False
     last_tag_t: float | None = None
     _scan_start_t: float | None = None
     _scan_resume_t: float | None = None
@@ -124,8 +129,18 @@ class NavSession:
     def _handle_blocked(self, side: str):
         self.block_count += 1
         if self.block_count >= self.config.block_retries:
-            self.state = State.FAILED
-            self.fail_reason = 'blocked'
+            # block_retries side-steps failed — don't give up: queue a
+            # back-up + full re-plan instead of failing. Only after
+            # max_recovery_cycles of this do we finally give up.
+            self.recovery_count += 1
+            if self.recovery_count > self.config.max_recovery_cycles:
+                self.state = State.FAILED
+                self.fail_reason = 'blocked'
+                return
+            self._recovery_pending = True
+            self.block_count = 0
+            self.queued.clear()          # drop stale side-steps; recovery wins
+            self.state = State.DRIVING
             return
         # Robot frame convention: +vy = strafe LEFT, -vy = strafe RIGHT
         # (matches agent_node._dir_to_twist: 'left' -> (0, +s, 0)).
@@ -182,6 +197,15 @@ class NavSession:
         if dist < self.config.arrived_radius_m:
             self.state = State.ARRIVED
             return NavCommand(0.0, 0.0, 0.0, 0.0, 'stop')
+
+        # recovery: side-steps exhausted -> back up, then re-plan from a
+        # fresh pose (the post-pulse dwell gives time to re-localize).
+        if self._recovery_pending:
+            self._recovery_pending = False
+            sec = self.config.recovery_backup_sec
+            self._drive_resume_t = now + sec + self.config.nav_dwell_sec
+            self.state = State.WAITING_PULSE
+            return NavCommand(-self.config.v_max, 0.0, 0.0, sec, 'backward')
 
         # dwell after the previous pulse: stay still so the detector grabs
         # sharp frames and re-localizes before the next move is computed.

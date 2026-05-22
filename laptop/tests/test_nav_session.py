@@ -140,9 +140,26 @@ def test_blocked_front_far_from_goal_is_obstacle():
     assert cmd.kind == 'strafe'
 
 
-def test_three_blocks_fail():
-    s = _sess(block_retries=3)
+def test_blocks_trigger_backup_recovery_not_fail():
+    """block_retries side-steps failing does NOT fail outright — it queues a
+    back-up recovery and keeps navigating."""
+    s = _sess(goal=(5.0, 0.0), block_retries=3, max_recovery_cycles=5)
     for _ in range(3):
+        s.tick((0.0, 0.0, 0.0), 0.0)
+        s.on_pi_event('blocked:front')
+    assert s.state is not State.FAILED
+    assert s.recovery_count == 1
+    # next drive tick issues the back-up pulse (reverse)
+    cmd = s.tick((0.0, 0.0, 0.0), 0.1)
+    assert cmd.kind == 'backward'
+    assert cmd.vx < 0
+
+
+def test_recovery_cycles_exhausted_finally_fails():
+    """After max_recovery_cycles back-ups the session does finally FAIL."""
+    s = _sess(goal=(5.0, 0.0), block_retries=3, max_recovery_cycles=2)
+    # each recovery cycle = block_retries blocked events
+    for _ in range(3 * 3):
         s.tick((0.0, 0.0, 0.0), 0.0)
         s.on_pi_event('blocked:front')
     assert s.state is State.FAILED
