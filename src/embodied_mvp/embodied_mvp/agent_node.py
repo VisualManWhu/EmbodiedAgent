@@ -62,6 +62,7 @@ class AgentNode(Node):
         self.declare_parameter('approach_steer_max', 0.22)   # cap on forward-pulse steering
         self.declare_parameter('stop_distance_m', 0.4)
         self.declare_parameter('nav_obstacle_dist_m', 0.2)  # NAV front-block threshold
+        self.declare_parameter('nav_pulse_max_sec', 20.0)   # Pi-side nav_pulse duration cap
         self.declare_parameter('arrived_height_ratio', 0.55)  # bbox height / image height -> "close enough"
         self.declare_parameter('det_conf_min', 0.4)
         self.declare_parameter('confirm_frames', 3)
@@ -111,6 +112,7 @@ class AgentNode(Node):
         self.steer_max = p('approach_steer_max').value
         self.stop_d = p('stop_distance_m').value
         self.nav_obstacle_d = p('nav_obstacle_dist_m').value
+        self.nav_pulse_max_sec = p('nav_pulse_max_sec').value
         self.arrived_h_ratio = p('arrived_height_ratio').value
         self.conf_min = p('det_conf_min').value
         self.confirm_n = int(p('confirm_frames').value)
@@ -299,7 +301,8 @@ class AgentNode(Node):
             wz = float(cmd.get('wz', 0.0))
             sec = float(cmd.get('seconds', 0.5))
             self.nav_twist = (vx, vy, wz)
-            self.nav_deadline = now + max(0.05, min(2.0, sec))
+            self.nav_deadline = now + max(0.05,
+                                          min(self.nav_pulse_max_sec, sec))
             self.nav_blocked = False
         elif action == 'nav_stop':
             self.mode = 'IDLE'
