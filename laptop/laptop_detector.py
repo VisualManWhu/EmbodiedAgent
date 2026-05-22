@@ -401,7 +401,8 @@ class SlamRunner:
         self.session_nav = NavSession(goal_xy=goal_xy, goal_id=goal_id,
                                       goal_label=goal_label,
                                       config=self.nav_config)
-        print(f'NAV start -> {goal_label} id={goal_id} at {goal_xy}')
+        print(f'[{time.time():.3f}] NAV start -> {goal_label} '
+              f'id={goal_id} at {goal_xy}')
 
     def stop_goto(self):
         if self.session_nav is not None:
@@ -417,6 +418,11 @@ class SlamRunner:
         payload = {'action': 'nav_pulse',
                    'vx': cmd.vx, 'vy': cmd.vy, 'wz': cmd.wz,
                    'seconds': cmd.seconds}
+        # timestamp is Unix epoch — same clock as the Pi ROS log stamps,
+        # so the two logs can be aligned line-for-line.
+        print(f'[{time.time():.3f}] NAV-> {cmd.kind:11s} '
+              f'vx={cmd.vx:+.2f} vy={cmd.vy:+.2f} wz={cmd.wz:+.2f} '
+              f'sec={cmd.seconds:.2f}  state={self.session_nav.state.value}')
         try:
             self.http.post(self.cmd_url, json=payload, timeout=0.5)
         except Exception:                           # noqa: BLE001
@@ -442,7 +448,10 @@ class SlamRunner:
         except Exception:                           # noqa: BLE001
             return
         if event:
+            before = self.session_nav.state.value
             self.session_nav.on_pi_event(event)
+            print(f'[{time.time():.3f}] NAV<- event={event:16s} '
+                  f'{before} -> {self.session_nav.state.value}')
             if self.session_nav.state.value in ('ARRIVED', 'FAILED'):
                 self._publish_nav_done()
 
@@ -454,7 +463,7 @@ class SlamRunner:
               'goal_label': self.session_nav.goal_label,
               'goal_id': self.session_nav.goal_id,
               'reason': reason}
-        print(f'NAV result: {ev}')
+        print(f'[{time.time():.3f}] NAV result: {ev}')
         with self._nav_done_lock:
             self._nav_done_event = ev
         if self.session_nav.state.value == 'FAILED':
