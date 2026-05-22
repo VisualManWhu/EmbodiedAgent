@@ -434,7 +434,12 @@ class SlamRunner:
                     and self.session_nav.state is State.WAITING_PULSE):
                 self.session_nav.state = State.DRIVING
             return
-        self.dead_reckoner.record_pulse(cmd.vx, cmd.vy, cmd.wz,
+        # The robot turns at w_eff while wz only commands w_max — feed the
+        # dead-reckoner the REAL angular rate or its yaw estimate lags ~2x,
+        # heading error never converges and the robot spins forever.
+        rot_scale = (self.nav_config.w_eff / self.nav_config.w_max
+                     if self.nav_config.w_max else 1.0)
+        self.dead_reckoner.record_pulse(cmd.vx, cmd.vy, cmd.wz * rot_scale,
                                         cmd.seconds, now)
 
     def _drain_pi_events(self):
