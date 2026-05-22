@@ -6,9 +6,23 @@ import pytest
 from slam.nav_session import NavCommand, NavConfig, NavSession, State
 
 
-def _sess(goal=(2.0, 0.0), **cfg):
-    return NavSession(goal_xy=goal, goal_id=1, goal_label='chair',
-                      config=NavConfig(**cfg))
+def _sess(goal=(2.0, 0.0), fixed=True, **cfg):
+    """Build a NavSession. ``fixed`` simulates an initial confirmed
+    localization (a real tag fix) so the session may drive — set False to
+    test the pre-first-fix scan-to-localize behaviour."""
+    s = NavSession(goal_xy=goal, goal_id=1, goal_label='chair',
+                   config=NavConfig(**cfg))
+    if fixed:
+        s.on_tag_fix(0.0)
+    return s
+
+
+def test_scans_before_first_fix():
+    """A goto issued with no confirmed localization yet must rotate-scan to
+    acquire a tag before driving — even if a (dead-reckoned) pose exists."""
+    s = _sess(fixed=False)
+    cmd = s.tick(robot_pose=(0.0, 0.0, 0.0), now=0.0)   # plausible pose, no fix
+    assert cmd.kind == 'scan_rotate'
 
 
 def test_arrives_when_inside_radius():

@@ -183,6 +183,12 @@ class NavSession:
         if robot_pose is None or pose_stale:
             return self._scan_tick(now)
 
+        # Require a CONFIRMED tag fix before driving toward the goal. Until
+        # the first real localization of this goto, a dead-reckoned pose is
+        # not trusted as a starting point — rotate-scan to acquire a tag.
+        if self.last_tag_t is None:
+            return self._scan_tick(now)
+
         # fresh pose -> normal drive
         if self.state is State.SCANNING:
             self.state = State.DRIVING
