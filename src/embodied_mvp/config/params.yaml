@@ -95,7 +95,7 @@ semantic_map_node:
   ros__parameters:
     port: 9092                   # laptop POSTs the semantic map here
     frame_id: map                # RViz fixed frame
-    camera_height_m: 0.30        # camera height above floor (base_link->camera TF)
+    camera_height_m: 0.15        # camera height above floor (base_link->camera TF)
 
 agent_node:
   ros__parameters:
