@@ -41,6 +41,7 @@ class NavConfig:
     strafe_speed: float = 0.15
     strafe_seconds: float = 0.6
     avoid_forward_seconds: float = 0.8
+    blocked_backup_sec: float = 1.0          # reverse for clearance per block
     block_retries: int = 3
     # after block_retries side-steps fail, don't give up: back up and re-plan.
     recovery_backup_sec: float = 2.0         # reverse duration per recovery
@@ -151,6 +152,12 @@ class NavSession:
             vy = +self.config.strafe_speed
         else:                                       # 'front' or unknown
             vy = +self.config.strafe_speed         # default: try left
+        # Back up first for clearance, then strafe away, then resume forward.
+        # The reverse step matters because the narrow front ultrasonic beam
+        # can lose a still-present obstacle after only a small strafe.
+        self.queued.append(NavCommand(-self.config.v_max, 0.0, 0.0,
+                                      self.config.blocked_backup_sec,
+                                      'backward'))
         self.queued.append(NavCommand(0.0, vy, 0.0,
                                       self.config.strafe_seconds, 'strafe'))
         self.queued.append(NavCommand(self.config.v_max, 0.0, 0.0,

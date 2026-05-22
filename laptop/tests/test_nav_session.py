@@ -89,17 +89,29 @@ def test_dwell_holds_between_drive_pulses():
     assert s.tick((0.1, 0.0, 0.0), cmd.seconds + 2.5) is not None
 
 
-def test_blocked_queues_strafe_then_forward():
+def _drain_queue(s, t0=0.1):
+    """Pop all queued avoidance pulses, advancing time + pulse_done each."""
+    cmds = []
+    t = t0
+    while True:
+        cmd = s.tick((0.0, 0.0, 0.0), t)
+        if cmd is None:
+            break
+        cmds.append(cmd)
+        s.on_pi_event('pulse_done')
+        t += 1.0
+    return cmds
+
+
+def test_blocked_queues_backup_strafe_forward():
     s = _sess(strafe_speed=0.15)
     s.tick((0.0, 0.0, 0.0), 0.0)
     s.on_pi_event('blocked:left')
-    cmd1 = s.tick((0.0, 0.0, 0.0), 0.1)
-    cmd2 = s.tick((0.0, 0.0, 0.0), 0.2)                         # next after pulse_done
-    s.on_pi_event('pulse_done')
-    cmd2 = s.tick((0.0, 0.0, 0.0), 0.3)
-    assert cmd1.kind == 'strafe'
-    assert cmd1.vy != 0
-    assert cmd2.kind == 'forward'
+    cmds = _drain_queue(s)
+    kinds = [c.kind for c in cmds[:3]]
+    assert kinds == ['backward', 'strafe', 'forward']
+    assert cmds[0].vx < 0                                       # backs up first
+    assert cmds[1].vy != 0
 
 
 def test_blocked_strafes_away_per_side():
@@ -109,17 +121,15 @@ def test_blocked_strafes_away_per_side():
     s = _sess(strafe_speed=0.15)
     s.tick((0.0, 0.0, 0.0), 0.0)
     s.on_pi_event('blocked:left')
-    cmd = s.tick((0.0, 0.0, 0.0), 0.1)
-    assert cmd.kind == 'strafe'
-    assert cmd.vy < 0, f'blocked:left should strafe right (vy<0), got vy={cmd.vy}'
+    strafe = [c for c in _drain_queue(s) if c.kind == 'strafe'][0]
+    assert strafe.vy < 0, f'blocked:left should strafe right (vy<0), got {strafe.vy}'
 
     # right blocked -> strafe left -> positive vy
     s = _sess(strafe_speed=0.15)
     s.tick((0.0, 0.0, 0.0), 0.0)
     s.on_pi_event('blocked:right')
-    cmd = s.tick((0.0, 0.0, 0.0), 0.1)
-    assert cmd.kind == 'strafe'
-    assert cmd.vy > 0, f'blocked:right should strafe left (vy>0), got vy={cmd.vy}'
+    strafe = [c for c in _drain_queue(s) if c.kind == 'strafe'][0]
+    assert strafe.vy > 0, f'blocked:right should strafe left (vy>0), got {strafe.vy}'
 
 
 def test_blocked_front_near_goal_is_arrival():
@@ -150,8 +160,9 @@ def test_blocked_front_far_from_goal_is_obstacle():
     s.tick((0.0, 0.0, 0.0), 0.0, target_ahead=False)
     s.on_pi_event('blocked:front')
     assert s.state is not State.ARRIVED
-    cmd = s.tick((0.0, 0.0, 0.0), 0.1)
-    assert cmd.kind == 'strafe'
+    # obstacle -> avoidance maneuver queued (back up, strafe away, forward)
+    kinds = [c.kind for c in _drain_queue(s)]
+    assert 'strafe' in kinds and 'backward' in kinds
 
 
 def test_blocks_trigger_backup_recovery_not_fail():
@@ -181,13 +192,12 @@ def test_recovery_cycles_exhausted_finally_fails():
 
 
 def test_block_count_resets_on_clean_pulse():
-    s = _sess(block_retries=3)
+    s = _sess(goal=(5.0, 0.0), block_retries=3)
     s.tick((0.0, 0.0, 0.0), 0.0)
     s.on_pi_event('blocked:front')
-    s.tick((0.0, 0.0, 0.0), 0.1)                                # strafe queued
-    s.on_pi_event('pulse_done')
-    s.tick((0.0, 0.0, 0.0), 0.2)                                # forward of strafe seq
-    s.on_pi_event('pulse_done')
+    # drain the whole backup+strafe+forward avoidance queue; block_count
+    # clears only once the queue is empty on a clean pulse_done.
+    _drain_queue(s)
     assert s.block_count == 0
 
 
