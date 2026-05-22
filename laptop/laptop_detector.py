@@ -516,10 +516,12 @@ def main():
     ap.add_argument('--nav-w-eff', type=float, default=1.12,
                     help='measured real yaw rate at --nav-w-max '
                          '(90deg / rotate_90_sec); sets rotate pulse duration')
-    ap.add_argument('--max-pulse-sec', type=float, default=10.0)
+    # keep pulses SHORT: a long forward pulse drives a fixed-curvature arc
+    # (blended steering wz x duration) and overruns the dead-reckon caps.
+    ap.add_argument('--max-pulse-sec', type=float, default=2.5)
     ap.add_argument('--no-tag-grace-sec', type=float, default=5.0)
-    ap.add_argument('--dr-distance-limit-m', type=float, default=1.5)
-    ap.add_argument('--dr-time-limit-sec', type=float, default=10.0)
+    ap.add_argument('--dr-distance-limit-m', type=float, default=0.5)
+    ap.add_argument('--dr-time-limit-sec', type=float, default=5.0)
     ap.add_argument('--block-retries', type=int, default=3)
     ap.add_argument('--scan-max-rotations', type=int, default=4)
     ap.add_argument('--landmark-conf-min', type=float, default=0.7)
