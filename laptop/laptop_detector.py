@@ -532,7 +532,8 @@ def main():
     ap.add_argument('--dr-distance-limit-m', type=float, default=0.5)
     ap.add_argument('--dr-time-limit-sec', type=float, default=5.0)
     ap.add_argument('--block-retries', type=int, default=3)
-    ap.add_argument('--scan-max-rotations', type=int, default=4)
+    ap.add_argument('--scan-max-rotations', type=int, default=12,
+                    help='scan steps before FAILED(lost); 12 x 30deg = 360deg')
     ap.add_argument('--landmark-conf-min', type=float, default=0.7)
     args = ap.parse_args()
 
