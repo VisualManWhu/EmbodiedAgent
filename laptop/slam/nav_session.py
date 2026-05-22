@@ -28,7 +28,12 @@ class NavConfig:
     # yaw can never land inside the tolerance -> the robot spins forever.
     heading_tol_rad: float = 0.5
     v_max: float = 0.15
-    w_max: float = 0.4
+    w_max: float = 0.5                       # commanded yaw rate (rotate/scan)
+    # effective yaw rate the robot ACTUALLY turns at when commanded w_max —
+    # open-loop, no encoder, so the commanded number is not the real rate.
+    # Used to compute rotate-pulse durations. Default from the kit's
+    # hand-measured rotate_90_sec: 90 deg / 1.4 s ~= 1.12 rad/s.
+    w_eff: float = 1.12
     max_pulse_sec: float = 2.5
     min_pulse_sec: float = 0.2
     # forward pulses blend in proportional steering so the robot curves onto
@@ -227,9 +232,10 @@ class NavSession:
 
         heading_err = _wrap(math.atan2(dy, dx) - yaw)
         if abs(heading_err) > self.config.heading_tol_rad:
-            # large error -> dedicated in-place rotate to face the goal
+            # large error -> dedicated in-place rotate to face the goal.
+            # duration uses w_eff (real rate), command uses w_max.
             wz = self.config.w_max * (1.0 if heading_err > 0 else -1.0)
-            sec = _clamp(abs(heading_err) / self.config.w_max,
+            sec = _clamp(abs(heading_err) / self.config.w_eff,
                          self.config.min_pulse_sec, self.config.max_pulse_sec)
             self._drive_resume_t = now + sec + self.config.nav_dwell_sec
             self.state = State.WAITING_PULSE
@@ -261,7 +267,7 @@ class NavSession:
         if self._scan_start_t is None:
             self._scan_start_t = now
         self.scan_count += 1
-        sec = self.config.scan_rotate_rad / self.config.w_max
+        sec = self.config.scan_rotate_rad / self.config.w_eff
         # next scan step only after this rotation finishes AND the dwell.
         self._scan_resume_t = now + sec + self.config.scan_dwell_sec
         self.state = State.WAITING_PULSE

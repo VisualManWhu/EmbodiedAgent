@@ -144,6 +144,7 @@ class SlamRunner:
             'arrived_radius_m': 'arrived_radius_m',
             'v_max': 'nav_v_max',
             'w_max': 'nav_w_max',
+            'w_eff': 'nav_w_eff',
             'max_pulse_sec': 'max_pulse_sec',
             'block_retries': 'block_retries',
             'scan_max_rotations': 'scan_max_rotations',
@@ -153,7 +154,8 @@ class SlamRunner:
             if val is not None:
                 setattr(self.nav_config, cfg_field, val)
         print(f'nav: arrived={self.nav_config.arrived_radius_m}m  '
-              f'v={self.nav_config.v_max}m/s  w={self.nav_config.w_max}rad/s  '
+              f'v={self.nav_config.v_max}m/s  '
+              f'w_cmd={self.nav_config.w_max}/w_eff={self.nav_config.w_eff}rad/s  '
               f'pulse<={self.nav_config.max_pulse_sec}s  '
               f'dr<={dr_time}s/{dr_dist}m  '
               f'block_retries={self.nav_config.block_retries}  '
@@ -509,11 +511,15 @@ def main():
     # navigation
     ap.add_argument('--arrived-radius-m', type=float, default=0.4)
     ap.add_argument('--nav-v-max', type=float, default=0.15)
-    ap.add_argument('--nav-w-max', type=float, default=0.4)
-    ap.add_argument('--max-pulse-sec', type=float, default=1.5)
+    ap.add_argument('--nav-w-max', type=float, default=0.5,
+                    help='commanded yaw rate for rotate/scan pulses')
+    ap.add_argument('--nav-w-eff', type=float, default=1.12,
+                    help='measured real yaw rate at --nav-w-max '
+                         '(90deg / rotate_90_sec); sets rotate pulse duration')
+    ap.add_argument('--max-pulse-sec', type=float, default=10.0)
     ap.add_argument('--no-tag-grace-sec', type=float, default=5.0)
-    ap.add_argument('--dr-distance-limit-m', type=float, default=0.5)
-    ap.add_argument('--dr-time-limit-sec', type=float, default=5.0)
+    ap.add_argument('--dr-distance-limit-m', type=float, default=1.5)
+    ap.add_argument('--dr-time-limit-sec', type=float, default=10.0)
     ap.add_argument('--block-retries', type=int, default=3)
     ap.add_argument('--scan-max-rotations', type=int, default=4)
     ap.add_argument('--landmark-conf-min', type=float, default=0.7)
@@ -543,6 +549,7 @@ def main():
             'arrived_radius_m': args.arrived_radius_m,
             'nav_v_max': args.nav_v_max,
             'nav_w_max': args.nav_w_max,
+            'nav_w_eff': args.nav_w_eff,
             'max_pulse_sec': args.max_pulse_sec,
             'no_tag_grace_sec': args.no_tag_grace_sec,
             'dr_distance_limit_m': args.dr_distance_limit_m,
