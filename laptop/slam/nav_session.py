@@ -21,7 +21,12 @@ class State(str, Enum):
 @dataclass
 class NavConfig:
     arrived_radius_m: float = 0.4
-    heading_tol_rad: float = 0.15            # >this -> dedicated rotate pulse
+    # >this heading error -> a dedicated in-place rotate. Kept loose: the
+    # robot only needs to be ROUGHLY aimed, then drives forward while the
+    # blended steering (steer_gain) does the fine correction. Tighter than
+    # this and open-loop mecanum rotation (no encoder) plus noisy single-tag
+    # yaw can never land inside the tolerance -> the robot spins forever.
+    heading_tol_rad: float = 0.5
     v_max: float = 0.15
     w_max: float = 0.4
     max_pulse_sec: float = 2.5
