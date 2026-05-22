@@ -514,10 +514,14 @@ class AgentNode(Node):
                 self.cmd_server.post_event('pulse_done')
             self.mode = 'IDLE'
             return
+        vx, vy, wz = self.nav_twist
         # obstacle checks — abort the pulse, post a typed event. NAV uses its
         # own (tighter) threshold so the robot can close right up to a goal
         # object; the laptop NavSession decides arrival-vs-obstacle.
-        if self.ir_range < self.nav_obstacle_d:
+        # ONLY a forward-moving pulse (vx > 0) can drive into the front
+        # obstacle — a back-up / strafe / rotate pulse must NOT be vetoed by
+        # the front sensor, or the robot can never reverse out of a jam.
+        if vx > 0.0 and self.ir_range < self.nav_obstacle_d:
             self.publish_full_cmd(0.0, 0.0, 0.0)
             self.cmd_server.post_event('blocked:front')
             self.get_logger().warn(
@@ -543,7 +547,6 @@ class AgentNode(Node):
         # clamp to the agent's existing v_max / w_max as a safety net — the
         # laptop NavSession already caps, but the Pi is the last line of
         # defense against a misconfigured or buggy upstream command.
-        vx, vy, wz = self.nav_twist
         vx = max(-self.v_max, min(self.v_max, vx))
         vy = max(-self.v_max, min(self.v_max, vy))
         wz = max(-self.w_max, min(self.w_max, wz))
