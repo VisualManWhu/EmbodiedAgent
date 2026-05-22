@@ -56,9 +56,23 @@ def test_pulse_done_unblocks_next_tick():
     s = _sess()
     s.tick((0.0, 0.0, 0.0), 0.0)
     s.on_pi_event('pulse_done')
-    cmd = s.tick((0.05, 0.0, 0.0), 0.5)
+    # advance well past the post-pulse dwell so the next pulse is issued
+    cmd = s.tick((0.05, 0.0, 0.0), 30.0)
     assert cmd is not None
     assert cmd.kind == 'forward'
+
+
+def test_dwell_holds_between_drive_pulses():
+    """After a drive pulse the robot dwells (nav_dwell_sec) before the next —
+    a tick inside the dwell window issues no command."""
+    s = _sess(nav_dwell_sec=2.0)
+    cmd = s.tick((0.0, 0.0, 0.0), 0.0)
+    assert cmd.kind == 'forward'
+    s.on_pi_event('pulse_done')
+    # tick shortly after pulse completion, still inside the dwell -> None
+    assert s.tick((0.1, 0.0, 0.0), cmd.seconds + 0.5) is None
+    # past the dwell -> next pulse issued
+    assert s.tick((0.1, 0.0, 0.0), cmd.seconds + 2.5) is not None
 
 
 def test_blocked_queues_strafe_then_forward():
