@@ -38,13 +38,17 @@ ir_node:
     max_range_m: 3.0
     field_of_view_rad: 0.26
     frame_id: ultrasonic_link
-    smoothing_window: 5
+    smoothing_window: 2          # small window: less lag closing on obstacles
     trigger_pin: 20
     echo_pin: 21
 
 side_ir_node:
   ros__parameters:
     backend: gpio               # mock | gpio (Makerobo binary IR)
+    # If NAV reports `blocked` immediately with nothing in the way, the IR
+    # modules' sensitivity pots are set too high (they detect the floor /
+    # ambient) — turn the pot down until the signal LED goes off in clear
+    # space. `mock` disables side IR entirely as a fallback.
     rate_hz: 10.0
     left_pin: 12
     right_pin: 16
@@ -91,7 +95,7 @@ semantic_map_node:
   ros__parameters:
     port: 9092                   # laptop POSTs the semantic map here
     frame_id: map                # RViz fixed frame
-    camera_height_m: 0.30        # camera height above floor (base_link->camera TF)
+    camera_height_m: 0.15        # camera height above floor (base_link->camera TF)
 
 agent_node:
   ros__parameters:
@@ -110,6 +114,8 @@ agent_node:
     search_rotate_sec: 0.5         # stop-and-scan: rotate burst length
     search_dwell_sec: 1.3          # stop-and-scan: still dwell for clean frames
     stop_distance_m: 0.4
+    nav_obstacle_dist_m: 0.35     # NAV front block threshold (margin for sensor lag)
+    nav_pulse_max_sec: 20.0       # Pi-side nav_pulse duration cap (laptop governs)
     arrived_height_ratio: 0.75    # bbox height / frame height -> stop (vision distance, sonar-independent)
     det_conf_min: 0.4             # drop low-confidence detections (avoid misclassification flicker)
     confirm_frames: 2             # (unused — lock is now time-windowed)
@@ -124,7 +130,11 @@ agent_node:
     approach_steer_gain: 0.0012   # forward-pulse steering gain (rad/s per px)
     approach_steer_max: 0.22      # cap on forward-pulse steering
     search_timeout_sec: 60.0
-    side_ir_enabled: true
+    # side_ir_enabled false: NAV/SEARCH ignore the side IR sensors. Set true
+    # once the left/right IR modules read False in clear space (tune the
+    # sensitivity pot, check the module is not aimed at the robot's own
+    # pan-tilt / chassis). A stuck-True side IR aborts every nav pulse.
+    side_ir_enabled: false
     avoid_yaw_bias: 0.35
     command_port: 9091
     manual_step_sec: 1.0

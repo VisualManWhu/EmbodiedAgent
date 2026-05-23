@@ -16,8 +16,9 @@ import threading
 import time
 
 import requests
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, Update)
+from telegram.ext import (ApplicationBuilder, CallbackQueryHandler,
+                          ContextTypes, MessageHandler, filters)
 
 from nl_parser import parse, SUPPORTED_TARGETS_CN
 from secrets_loader import load_bot_secrets
@@ -35,9 +36,11 @@ SNAPSHOT_URL = f'http://{PI_IP}:8080/snapshot'
 DETECTOR_URL = 'http://127.0.0.1:8090/annotated'
 # laptop_detector --slam serves the top-down semantic map here
 MAP_URL = 'http://127.0.0.1:8091/map.png'
+NAV_API = 'http://127.0.0.1:8092'
 
 HELP = ('支持指令：前进/后退/左移/右移/左转/右转/停/拍照/旋转拍照/地图/'
-        '去找<目标>。可加时长：前进3秒、后退2秒(最长30秒)。'
+        '去找<目标>/去<目标>/去 id N/回原点/巡逻/绕室。'
+        '可加时长：前进3秒、后退2秒(最长30秒)。'
         '目标：' + SUPPORTED_TARGETS_CN)
 
 PHOTO_LABELS = {1: '前', 2: '右', 3: '后', 4: '左'}
@@ -87,12 +90,168 @@ def get_status():
         return None
 
 
+def fetch_candidates(cls):
+    try:
+        r = _session.post(f'{NAV_API}/nav/candidates',
+                          json={'target_class': cls}, timeout=3.0)
+        return r.json().get('candidates', [])
+    except requests.RequestException:
+        return []
+
+
+def start_goto_id(lid):
+    try:
+        r = _session.post(f'{NAV_API}/nav/goto',
+                          json={'landmark_id': lid}, timeout=3.0)
+        return r.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def start_goto_tag(tid):
+    try:
+        r = _session.post(f'{NAV_API}/nav/goto',
+                          json={'tag_id': tid}, timeout=3.0)
+        return r.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def start_goto_xy(x, y, label):
+    try:
+        r = _session.post(f'{NAV_API}/nav/goto',
+                          json={'xy': [x, y], 'label': label}, timeout=3.0)
+        return r.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def poll_nav_done():
+    try:
+        r = _session.get(f'{NAV_API}/nav/done', timeout=2.0)
+        if r.status_code == 200:
+            data = r.json()
+            return data if data else None
+    except requests.RequestException:
+        pass
+    return None
+
+
+def stop_nav():
+    """Tell the laptop to abort any active NavSession. Best effort."""
+    try:
+        _session.post(f'{NAV_API}/nav/stop', timeout=2.0)
+    except requests.RequestException:
+        pass
+
+
+def _poll_nav(loop, context, chat_id, stop_after_sec=300):
+    import asyncio
+    deadline = time.time() + stop_after_sec
+    while time.time() < deadline:
+        time.sleep(0.7)
+        ev = poll_nav_done()
+        if ev is None:
+            continue
+        state = ev.get('state')
+        label = ev.get('goal_label') or '?'
+        gid = ev.get('goal_id')
+        reason = ev.get('reason')
+        if state == 'ARRIVED':
+            asyncio.run_coroutine_threadsafe(
+                context.bot.send_message(chat_id,
+                    f'已到达 {label}' + (f' (id {gid})' if gid is not None else '')),
+                loop)
+        else:
+            asyncio.run_coroutine_threadsafe(
+                context.bot.send_message(chat_id,
+                    f'导航失败 ({reason or state})'), loop)
+        return
+    # loop exited without a nav_done event — tell the user, don't fail silently
+    asyncio.run_coroutine_threadsafe(
+        context.bot.send_message(chat_id,
+            f'导航超时 ({stop_after_sec:.0f}s 无结果)'), loop)
+
+
+def _fetch_list(path):
+    try:
+        r = _session.get(f'{NAV_API}/{path}', timeout=3.0)
+        return r.json()
+    except requests.RequestException:
+        return {}
+
+
+def _wait_for_nav_done(timeout_sec):
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        time.sleep(0.7)
+        ev = poll_nav_done()
+        if ev:
+            return ev
+    return None
+
+
+def _run_patrol(loop, context, chat_id):
+    import asyncio
+    data = _fetch_list('nav/landmarks')
+    landmarks = data.get('landmarks', [])
+    if not landmarks:
+        asyncio.run_coroutine_threadsafe(
+            context.bot.send_message(chat_id, '地图中没有 CONFIRMED 物体'), loop)
+        return
+    for lm in landmarks:
+        asyncio.run_coroutine_threadsafe(
+            context.bot.send_message(chat_id,
+                f"前往 {lm['label']} id {lm['id']} ..."), loop)
+        if not start_goto_id(lm['id']):
+            continue
+        ev = _wait_for_nav_done(180.0)
+        if ev is None or ev.get('state') != 'ARRIVED':
+            asyncio.run_coroutine_threadsafe(
+                context.bot.send_message(chat_id,
+                    f"跳过 {lm['label']} id {lm['id']} ({ev.get('reason') if ev else 'timeout'})"),
+                loop)
+            continue
+        asyncio.run_coroutine_threadsafe(
+            _send_photo(context, chat_id,
+                        f"{lm['label']} id {lm['id']}"), loop)
+    asyncio.run_coroutine_threadsafe(
+        context.bot.send_message(chat_id, '巡逻完成'), loop)
+
+
+def _run_room_tour(loop, context, chat_id):
+    import asyncio
+    data = _fetch_list('nav/tags')
+    tags = sorted(data.get('tags', []), key=lambda t: t['id'])
+    if not tags:
+        asyncio.run_coroutine_threadsafe(
+            context.bot.send_message(chat_id, 'tag_map 为空'), loop)
+        return
+    for t in tags:
+        asyncio.run_coroutine_threadsafe(
+            context.bot.send_message(chat_id, f"前往 tag {t['id']} ..."), loop)
+        if not start_goto_tag(t['id']):
+            continue
+        ev = _wait_for_nav_done(180.0)
+        if ev is None or ev.get('state') != 'ARRIVED':
+            asyncio.run_coroutine_threadsafe(
+                context.bot.send_message(chat_id,
+                    f"跳过 tag {t['id']} ({ev.get('reason') if ev else 'timeout'})"),
+                loop)
+            continue
+    asyncio.run_coroutine_threadsafe(
+        context.bot.send_message(chat_id, '绕室完成'), loop)
+
+
 async def _send_photo(context, chat_id, caption):
     jpg = fetch_photo()
     if jpg is None:
         await context.bot.send_message(chat_id, '取图失败')
         return
     await context.bot.send_photo(chat_id, photo=io.BytesIO(jpg), caption=caption)
+
+
+SEARCH_TIMEOUT_SEC = 30.0
 
 
 def _poll_events(loop, context, chat_id, stop_after_sec=120):
@@ -125,6 +284,39 @@ def _poll_events(loop, context, chat_id, stop_after_sec=120):
             return
 
 
+def _run_chain(loop, context, chat_id, target):
+    """SEARCH first; on timeout fall back to NAV via the nav api."""
+    import asyncio
+    deadline = time.time() + SEARCH_TIMEOUT_SEC
+    while time.time() < deadline:
+        time.sleep(0.7)
+        st = get_status()
+        if st is None:
+            continue
+        ev = st.get('event', '')
+        if ev.startswith('arrived:'):
+            target_name = ev.split(':', 1)[1]
+            asyncio.run_coroutine_threadsafe(
+                context.bot.send_message(chat_id, f'已到达 {target_name}'), loop)
+            asyncio.run_coroutine_threadsafe(
+                _send_photo(context, chat_id, f'到达 {target_name}'), loop)
+            return
+    asyncio.run_coroutine_threadsafe(
+        context.bot.send_message(chat_id,
+            f'{SEARCH_TIMEOUT_SEC:.0f}s 未发现 {target}, 改用地图导航'), loop)
+    cands = fetch_candidates(target)
+    if not cands:
+        asyncio.run_coroutine_threadsafe(
+            context.bot.send_message(chat_id,
+                f'地图中也没有 {target} — 放弃'), loop)
+        return
+    start_goto_id(cands[0]['id'])
+    asyncio.run_coroutine_threadsafe(
+        context.bot.send_message(chat_id,
+            f"前往 {target} id {cands[0]['id']} ..."), loop)
+    _poll_nav(loop, context, chat_id)
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in AUTHORIZED_IDS:
@@ -151,9 +343,76 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                          caption='语义地图')
         return
 
+    if cmd['action'] == 'goto':
+        loop = __import__('asyncio').get_running_loop()
+        if cmd.get('origin'):
+            ok = start_goto_tag(0)
+            if not ok:
+                await context.bot.send_message(chat_id, '原点 (tag 0) 未在地图')
+            else:
+                await context.bot.send_message(chat_id, '前往原点 ...')
+                threading.Thread(target=_poll_nav,
+                                 args=(loop, context, chat_id),
+                                 daemon=True).start()
+            return
+        if 'landmark_id' in cmd:
+            ok = start_goto_id(cmd['landmark_id'])
+            if not ok:
+                await context.bot.send_message(
+                    chat_id, f"id {cmd['landmark_id']} 未在地图")
+            else:
+                await context.bot.send_message(
+                    chat_id, f"前往 landmark id {cmd['landmark_id']} ...")
+                threading.Thread(target=_poll_nav,
+                                 args=(loop, context, chat_id),
+                                 daemon=True).start()
+            return
+        if 'target_class' in cmd:
+            cands = fetch_candidates(cmd['target_class'])
+            if not cands:
+                await context.bot.send_message(
+                    chat_id, f"未在地图中找到 {cmd['target_class']}")
+                return
+            if len(cands) == 1:
+                lid = cands[0]['id']
+                start_goto_id(lid)
+                await context.bot.send_message(
+                    chat_id, f"前往 {cmd['target_class']} id {lid} ...")
+                threading.Thread(target=_poll_nav,
+                                 args=(loop, context, chat_id),
+                                 daemon=True).start()
+                return
+            buttons = [[InlineKeyboardButton(
+                f"{c['label']} id {c['id']} ({c['dist_m']:.1f}m)",
+                callback_data=f"goto:{c['id']}")] for c in cands]
+            await context.bot.send_message(
+                chat_id, f"找到 {len(cands)} 个 {cmd['target_class']}",
+                reply_markup=InlineKeyboardMarkup(buttons))
+            return
+
+    if cmd['action'] == 'patrol':
+        await context.bot.send_message(chat_id, '开始巡逻 ...')
+        threading.Thread(target=_run_patrol, args=(
+            __import__('asyncio').get_running_loop(), context, chat_id),
+            daemon=True).start()
+        return
+
+    if cmd['action'] == 'room_tour':
+        await context.bot.send_message(chat_id, '开始绕室 ...')
+        threading.Thread(target=_run_room_tour, args=(
+            __import__('asyncio').get_running_loop(), context, chat_id),
+            daemon=True).start()
+        return
+
     if cmd['action'] == 'find' and cmd['target'] is None:
         await context.bot.send_message(chat_id, '不认识该目标。' + HELP)
         return
+
+    # `stop` must abort any laptop-side NavSession in addition to telling the
+    # Pi to switch to IDLE — otherwise the next tick re-issues a nav_pulse
+    # and the robot resumes navigating.
+    if cmd['action'] == 'stop':
+        stop_nav()
 
     if not post_command(cmd):
         await context.bot.send_message(chat_id, '小车失联')
@@ -162,7 +421,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cmd['action'] == 'find':
         await context.bot.send_message(chat_id, f"前往寻找 {cmd['target']} ...")
         loop = __import__('asyncio').get_running_loop()
-        threading.Thread(target=_poll_events, args=(loop, context, chat_id),
+        threading.Thread(target=_run_chain,
+                         args=(loop, context, chat_id, cmd['target']),
                          daemon=True).start()
     elif cmd['action'] == 'rotate_photo':
         await context.bot.send_message(chat_id, '开始旋转拍照 ...')
@@ -173,9 +433,27 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id, f"执行：{text}")
 
 
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id not in AUTHORIZED_IDS:
+        return
+    data = q.data or ''
+    if data.startswith('goto:'):
+        lid = int(data.split(':', 1)[1])
+        if start_goto_id(lid):
+            await q.edit_message_text(f'前往 landmark id {lid} ...')
+            threading.Thread(target=_poll_nav, args=(
+                __import__('asyncio').get_running_loop(), context,
+                q.message.chat.id), daemon=True).start()
+        else:
+            await q.edit_message_text('启动导航失败')
+
+
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(CallbackQueryHandler(on_callback))
     print('telegram bot running — message your bot from the phone')
     app.run_polling()
 

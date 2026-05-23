@@ -61,6 +61,8 @@ class AgentNode(Node):
         self.declare_parameter('approach_steer_gain', 0.0012)# forward-pulse steering gain (rad/s per px)
         self.declare_parameter('approach_steer_max', 0.22)   # cap on forward-pulse steering
         self.declare_parameter('stop_distance_m', 0.4)
+        self.declare_parameter('nav_obstacle_dist_m', 0.2)  # NAV front-block threshold
+        self.declare_parameter('nav_pulse_max_sec', 20.0)   # Pi-side nav_pulse duration cap
         self.declare_parameter('arrived_height_ratio', 0.55)  # bbox height / image height -> "close enough"
         self.declare_parameter('det_conf_min', 0.4)
         self.declare_parameter('confirm_frames', 3)
@@ -109,6 +111,8 @@ class AgentNode(Node):
         self.steer_gain = p('approach_steer_gain').value
         self.steer_max = p('approach_steer_max').value
         self.stop_d = p('stop_distance_m').value
+        self.nav_obstacle_d = p('nav_obstacle_dist_m').value
+        self.nav_pulse_max_sec = p('nav_pulse_max_sec').value
         self.arrived_h_ratio = p('arrived_height_ratio').value
         self.conf_min = p('det_conf_min').value
         self.confirm_n = int(p('confirm_frames').value)
@@ -169,6 +173,9 @@ class AgentNode(Node):
         self.rp_phase = 'dwell'
         self.rp_phase_start = 0.0
         self.rp_photo_posted = False
+        self.nav_twist = (0.0, 0.0, 0.0)
+        self.nav_deadline = 0.0
+        self.nav_blocked = False
         self.cmd_server = CommandServer(self.get_parameter('command_port').value)
         self.get_logger().info(
             f"agent_node command server on :{self.get_parameter('command_port').value}")
@@ -241,6 +248,24 @@ class AgentNode(Node):
         v.y = pitch
         self.pt_pub.publish(v)
 
+    def _side_ir_bias(self) -> float:
+        """Yaw bias (rad/s) to steer away from a triggered side IR.
+
+        ``+wz`` = rotate left in this codebase, so obstacle on the LEFT biases
+        negative (turn right) and obstacle on the RIGHT biases positive (turn
+        left). Returns 0 when side IR is disabled or both sides clear; if both
+        sides hit the biases cancel and the caller should already be slowing /
+        stopping via the front sensor.
+        """
+        if not self.side_ir_enabled:
+            return 0.0
+        bias = 0.0
+        if self.obs_left:
+            bias -= self.avoid_bias
+        if self.obs_right:
+            bias += self.avoid_bias
+        return bias
+
     def _dir_to_twist(self, direction):
         f, s, y = self.manual_fwd, self.manual_strafe, self.manual_yaw
         return {
@@ -269,6 +294,20 @@ class AgentNode(Node):
                 self.target_class = target
                 self.reset_search(now)
                 self.mode = 'SEARCH'
+        elif action == 'nav_pulse':
+            self.mode = 'NAV'
+            vx = float(cmd.get('vx', 0.0))
+            vy = float(cmd.get('vy', 0.0))
+            wz = float(cmd.get('wz', 0.0))
+            sec = float(cmd.get('seconds', 0.5))
+            self.nav_twist = (vx, vy, wz)
+            self.nav_deadline = now + max(0.05,
+                                          min(self.nav_pulse_max_sec, sec))
+            self.nav_blocked = False
+        elif action == 'nav_stop':
+            self.mode = 'IDLE'
+            self.nav_twist = (0.0, 0.0, 0.0)
+            self.nav_deadline = 0.0
         elif action == 'rotate_photo':
             self.mode = 'ROTATE_PHOTO'
             self.rp_index = 0
@@ -389,8 +428,14 @@ class AgentNode(Node):
             return
 
         if now < self.burst_end:
-            # mid-pulse — keep executing the committed move
-            self.publish_cmd(self.burst_vx, self.burst_wz)
+            # mid-pulse — keep executing the committed move, but if a side IR
+            # fires DURING a forward burst, blend in a yaw bias to steer away
+            # from the obstacle instead of plowing into it.
+            wz = self.burst_wz
+            if self.burst_vx > 0:
+                wz = max(-self.w_max,
+                         min(self.w_max, wz + self._side_ir_bias()))
+            self.publish_cmd(self.burst_vx, wz)
             return
 
         # pulse finished — stop
@@ -420,6 +465,11 @@ class AgentNode(Node):
                 self.burst_wz = max(-self.steer_max, min(self.steer_max, steer))
             else:
                 self.burst_wz = 0.0
+            # blend in side-IR avoidance so the forward pulse curves away
+            # from a left/right obstacle instead of grazing it.
+            self.burst_wz = max(-self.w_max,
+                                min(self.w_max,
+                                    self.burst_wz + self._side_ir_bias()))
             self.burst_end = now + self.fwd_step_sec
 
     def tick_manual(self, now):
@@ -454,6 +504,54 @@ class AgentNode(Node):
                     self.rp_phase_start = now
                     self.rp_photo_posted = False
 
+    def tick_nav(self, now):
+        """Execute a single NAV pulse. Abort on ultrasonic / side IR; report
+        events back to the laptop via the command_server status channel.
+        """
+        if now >= self.nav_deadline:
+            self.publish_full_cmd(0.0, 0.0, 0.0)
+            if not self.nav_blocked:
+                self.cmd_server.post_event('pulse_done')
+            self.mode = 'IDLE'
+            return
+        vx, vy, wz = self.nav_twist
+        # obstacle checks — abort the pulse, post a typed event. NAV uses its
+        # own (tighter) threshold so the robot can close right up to a goal
+        # object; the laptop NavSession decides arrival-vs-obstacle.
+        # ONLY a forward-moving pulse (vx > 0) can drive into the front
+        # obstacle — a back-up / strafe / rotate pulse must NOT be vetoed by
+        # the front sensor, or the robot can never reverse out of a jam.
+        if vx > 0.0 and self.ir_range < self.nav_obstacle_d:
+            self.publish_full_cmd(0.0, 0.0, 0.0)
+            self.cmd_server.post_event('blocked:front')
+            self.get_logger().warn(
+                f'NAV blocked:front  ir_range={self.ir_range:.2f} '
+                f'< nav_obstacle_d={self.nav_obstacle_d:.2f}')
+            self.nav_blocked = True
+            self.mode = 'IDLE'
+            return
+        if self.side_ir_enabled and self.obs_left:
+            self.publish_full_cmd(0.0, 0.0, 0.0)
+            self.cmd_server.post_event('blocked:left')
+            self.get_logger().warn('NAV blocked:left  obs_left=True')
+            self.nav_blocked = True
+            self.mode = 'IDLE'
+            return
+        if self.side_ir_enabled and self.obs_right:
+            self.publish_full_cmd(0.0, 0.0, 0.0)
+            self.cmd_server.post_event('blocked:right')
+            self.get_logger().warn('NAV blocked:right  obs_right=True')
+            self.nav_blocked = True
+            self.mode = 'IDLE'
+            return
+        # clamp to the agent's existing v_max / w_max as a safety net — the
+        # laptop NavSession already caps, but the Pi is the last line of
+        # defense against a misconfigured or buggy upstream command.
+        vx = max(-self.v_max, min(self.v_max, vx))
+        vy = max(-self.v_max, min(self.v_max, vy))
+        wz = max(-self.w_max, min(self.w_max, wz))
+        self.publish_full_cmd(vx, vy, wz)
+
     def tick(self):
         now = time.time()
         cmd = self.cmd_server.take_command()
@@ -467,6 +565,8 @@ class AgentNode(Node):
             self.tick_manual(now)
         elif self.mode == 'SEARCH':
             self.tick_search()
+        elif self.mode == 'NAV':
+            self.tick_nav(now)
         elif self.mode == 'ROTATE_PHOTO':
             self.tick_rotate_photo(now)
 
