@@ -7,6 +7,11 @@ parse(text) returns one of:
   {'action': 'photo'}
   {'action': 'rotate_photo'}
   {'action': 'map'}                               # request the semantic map
+  {'action': 'goto', 'landmark_id': <int>}        # nav to a specific id
+  {'action': 'goto', 'origin': True}              # nav to tag 0
+  {'action': 'goto', 'target_class': '<coco_class>'}  # nav to nearest of class
+  {'action': 'patrol'}                            # visit each CONFIRMED landmark
+  {'action': 'room_tour'}                         # visit each tag by id
   {'action': 'find', 'target': '<coco_class>'}   # target None if unrecognised
   None  -- unparseable
 
@@ -187,6 +192,26 @@ def parse(text):
 
     if any(k in t for k in ('拍照', '照片', '看看', 'photo')):
         return {'action': 'photo'}
+
+    # goto id N -- must match before plain '左/前/后' direction matchers
+    m = re.search(r'(?:去|goto)\s*id\s*(\d+)', t, flags=re.IGNORECASE)
+    if m:
+        return {'action': 'goto', 'landmark_id': int(m.group(1))}
+
+    if any(k in t for k in ('回原点', '回到原点', 'go home', 'home')):
+        return {'action': 'goto', 'origin': True}
+
+    if any(k in t for k in ('巡逻', 'patrol')):
+        return {'action': 'patrol'}
+
+    if any(k in t for k in ('绕室', 'room tour')):
+        return {'action': 'room_tour'}
+
+    # 'goto <class>' / '去<class>' (but not '去找') -- requires a target match
+    if '去找' not in t and ('去' in t or t.lower().startswith('goto')):
+        target = _match_target(t)
+        if target:
+            return {'action': 'goto', 'target_class': target}
 
     if any(k in t for k in ('找', '寻找', '靠近', 'find')):
         return {'action': 'find', 'target': _match_target(t)}

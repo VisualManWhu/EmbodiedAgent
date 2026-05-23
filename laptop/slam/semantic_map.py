@@ -205,9 +205,13 @@ class SemanticMap:
     # ---- output -----------------------------------------------------------
 
     def snapshot(self, confirmed_only: bool = False) -> list:
-        """Lightweight list of landmarks for rendering / POSTing to the Pi."""
+        """Lightweight list of landmarks for rendering / POSTing to the Pi.
+
+        Iterates over a materialized list of values so callers on background
+        threads do not race the main thread's add/remove on ``self.landmarks``.
+        """
         out = []
-        for lm in self.landmarks.values():
+        for lm in list(self.landmarks.values()):
             if confirmed_only and lm.state != CONFIRMED:
                 continue
             out.append({
