@@ -281,3 +281,100 @@ def test_scan_count_clears_after_tag_recovery():
     s.tick((0.0, 0.0, 0.0), t, pose_stale=True)
     assert s.state is State.FAILED
     assert s.fail_reason == 'lost'
+
+
+def _front_strafe(s):
+    """Queue an avoidance for a blocked:front and return its strafe pulse."""
+    s.queued.clear()
+    s.on_pi_event('blocked:front')
+    return [c for c in s.queued if c.kind == 'strafe'][0]
+
+
+def test_repeated_front_blocks_strafe_further_each_time():
+    """Field bug: a fixed 9 cm side-step three times never cleared a real
+    obstacle. A second block in a row must step sideways further."""
+    s = _sess(goal=(5.0, 0.0), block_retries=3, strafe_seconds=1.0)
+    s.tick((0.0, 0.0, 0.0), 0.0)
+    first = _front_strafe(s)
+    second = _front_strafe(s)
+    assert second.seconds > first.seconds
+    assert second.vy * first.vy > 0                 # same side while escalating
+
+
+def test_strafe_duration_is_capped():
+    s = _sess(goal=(5.0, 0.0), block_retries=10, strafe_seconds=1.0,
+              strafe_max_seconds=2.5)
+    s.tick((0.0, 0.0, 0.0), 0.0)
+    for _ in range(6):
+        last = _front_strafe(s)
+    assert last.seconds == 2.5
+
+
+def test_after_a_failed_recovery_cycle_the_other_side_is_tried():
+    s = _sess(goal=(5.0, 0.0), block_retries=3, max_recovery_cycles=5)
+    s.tick((0.0, 0.0, 0.0), 0.0)
+    first = _front_strafe(s)
+    _front_strafe(s)
+    s.on_pi_event('blocked:front')                  # 3rd -> recovery cycle
+    assert s.recovery_count == 1
+    after = _front_strafe(s)
+    assert after.vy * first.vy < 0                  # opposite side now
+
+
+# ---- final heading (tag goals: stop in front of the tag, facing it) -------
+
+def _facing_sess(final_yaw, **cfg):
+    s = NavSession(goal_xy=(2.0, 0.0), goal_id=None, goal_label='tag0',
+                   config=NavConfig(**cfg), final_yaw=final_yaw)
+    s.on_tag_fix(0.0)
+    return s
+
+
+def test_at_goal_but_facing_away_rotates_to_final_heading_before_arriving():
+    s = _facing_sess(final_yaw=math.pi / 2)
+    cmd = s.tick(robot_pose=(2.0, 0.0, 0.0), now=0.0)
+    assert cmd.kind == 'rotate' and cmd.wz > 0       # turn left toward +90 deg
+    assert cmd.vx == 0.0
+    assert s.state is State.WAITING_PULSE
+
+
+def test_at_goal_and_facing_right_way_arrives():
+    s = _facing_sess(final_yaw=math.pi / 2)
+    cmd = s.tick(robot_pose=(2.0, 0.0, math.pi / 2 + 0.1), now=0.0)
+    assert s.state is State.ARRIVED and cmd.kind == 'stop'
+
+
+def test_facing_turn_waits_for_dwell_then_arrives_once_aligned():
+    s = _facing_sess(final_yaw=math.pi / 2, nav_dwell_sec=2.0)
+    first = s.tick(robot_pose=(2.0, 0.0, 0.0), now=0.0)
+    s.on_pi_event('pulse_done')
+    # still settling after the turn: no new command, not arrived yet
+    assert s.tick(robot_pose=(2.0, 0.0, 1.0), now=first.seconds + 0.5) is None
+    cmd = s.tick(robot_pose=(2.0, 0.0, math.pi / 2), now=first.seconds + 2.5)
+    assert s.state is State.ARRIVED and cmd.kind == 'stop'
+
+
+def test_facing_does_not_drive_away_if_the_turn_nudges_it_out_of_radius():
+    s = _facing_sess(final_yaw=math.pi / 2, arrived_radius_m=0.4)
+    first = s.tick(robot_pose=(2.0, 0.0, 0.0), now=0.0)
+    s.on_pi_event('pulse_done')
+    cmd = s.tick(robot_pose=(1.5, 0.0, math.pi / 2), now=first.seconds + 3.0)
+    assert s.state is State.ARRIVED and cmd.kind == 'stop'
+
+
+def test_facing_gives_up_after_a_few_attempts_and_still_arrives():
+    s = _facing_sess(final_yaw=math.pi / 2, final_face_max=2, nav_dwell_sec=0.0)
+    t = 0.0
+    for _ in range(2):
+        cmd = s.tick(robot_pose=(2.0, 0.0, 0.0), now=t)
+        assert cmd.kind == 'rotate'
+        s.on_pi_event('pulse_done')
+        t += 10.0
+    cmd = s.tick(robot_pose=(2.0, 0.0, 0.0), now=t)   # never converged
+    assert s.state is State.ARRIVED and cmd.kind == 'stop'
+
+
+def test_no_final_heading_arrives_immediately_as_before():
+    s = _sess(arrived_radius_m=0.4)
+    cmd = s.tick(robot_pose=(2.0, 0.0, 3.0), now=0.0)
+    assert s.state is State.ARRIVED and cmd.kind == 'stop'

@@ -162,7 +162,13 @@ class SlamRunner:
               f'scan_rot<={self.nav_config.scan_max_rotations}')
         # used by Task 7 nav api when filtering class candidates.
         self.landmark_conf_min = nav_overrides.get('landmark_conf_min', 0.7)
+        self.tag_standoff_m = nav_overrides.get('tag_standoff_m') or 1.0
         self.session_nav = None                     # NavSession | None
+        self.seek = None                            # SeekSession | None
+        self._class_hits = {}                       # cls -> deque[timestamp]
+        self._class_sight = {}                      # cls -> latest sighting
+        from pi_events import EventCursor
+        self.pi_events = EventCursor()
         self.event_url = f'http://{pi_ip}:9091/status'
         self.cmd_url = f'http://{pi_ip}:9091/command'
         self.http = requests.Session()
@@ -207,7 +213,11 @@ class SlamRunner:
             self.save()
             self._last_save = now
 
-        # --- nav update --------------------------------------------------
+        # --- nav / seek update -------------------------------------------
+        self._record_hits(detections, now, frame.shape)
+        events = []
+        if self.session_nav is not None or self.seek is not None:
+            events = self.pi_events.take(self._get_pi_status())
         nav_status = None
         if self.session_nav is not None:
             if located:
@@ -218,20 +228,55 @@ class SlamRunner:
             else:
                 robot_pose, pose_stale = self.dead_reckoner.pose_at(now)
             target_ahead = self._target_seen_ahead(detections, frame.shape)
+            # for the NAV-> log line: where nav believes the robot is
+            self._nav_pose_dbg = (robot_pose, located, pose_stale)
             cmd = self.session_nav.tick(robot_pose, now, pose_stale=pose_stale,
                                         target_ahead=target_ahead)
             if cmd is not None and cmd.kind != 'stop':
                 self._send_nav(cmd, now)
-            self._drain_pi_events()
+            self._feed_nav_events(events, now)
             # ARRIVED-on-first-tick (cmd.kind == 'stop') and FAILED('lost')
             # from scan exhaustion reach terminal state WITHOUT a Pi event,
-            # so _drain_pi_events would never publish them — handle directly.
+            # so _feed_nav_events would never publish them — handle directly.
             if (self.session_nav is not None
                     and self.session_nav.state.value in ('ARRIVED', 'FAILED')):
-                self._publish_nav_done()
+                self._publish_nav_done(now)
             if self.session_nav is not None:
                 nav_status = self.session_nav.state.value
+        seek = self.seek            # local: an api thread may clear it
+        if seek is not None:
+            self._tick_seek(seek, events, now)
+            if not seek.done:
+                nav_status = (f'SEEK-{seek.state.value}'
+                              + (f'/{nav_status}' if nav_status else ''))
         return len(tag_dets), located, nav_status
+
+    # ---- class sightings (shared by seek + arrival verification) --------
+
+    HITS_KEPT = 20
+
+    def _record_hits(self, detections, now, frame_shape=None):
+        import collections
+        biggest = {}
+        for d in detections:
+            self._class_hits.setdefault(
+                d['cls'], collections.deque(maxlen=self.HITS_KEPT)).append(now)
+            if 'h' in d and d['h'] > biggest.get(d['cls'], {}).get('h', 0.0):
+                biggest[d['cls']] = d
+        if frame_shape is None:
+            return
+        fh = float(frame_shape[0])
+        for cls, d in biggest.items():
+            top, bottom = d['cy'] - d['h'] / 2.0, d['cy'] + d['h'] / 2.0
+            self._class_sight[cls] = {
+                't': now, 'h_frac': d['h'] / fh,
+                'clipped': top <= 0.02 * fh or bottom >= 0.98 * fh}
+
+    def _hits(self, cls):
+        return list(self._class_hits.get(cls, ()))
+
+    def _seen_recently(self, cls, now, window_sec=3.0):
+        return any(t >= now - window_sec for t in self._hits(cls))
 
     def _target_seen_ahead(self, detections, frame_shape):
         """True if YOLO currently sees the active goal's object class large
@@ -310,7 +355,10 @@ class SlamRunner:
                 if self.path == '/nav/candidates':
                     runner._handle_candidates(self)
                 elif self.path == '/nav/goto':
+                    runner.seek = None      # an explicit goto ends any seek
                     runner._handle_goto(self)
+                elif self.path == '/nav/seek':
+                    runner._handle_seek(self)
                 elif self.path == '/nav/stop':
                     runner.stop_goto()
                     self.send_response(200)
@@ -351,7 +399,7 @@ class SlamRunner:
 
     def _handle_goto(self, h):
         import json as _json
-        from slam.landmark_selector import by_id, by_tag
+        from slam.landmark_selector import by_id, tag_standoff
         n = int(h.headers.get('Content-Length', 0))
         req = _json.loads(h.rfile.read(n))
         if 'landmark_id' in req:
@@ -361,14 +409,28 @@ class SlamRunner:
             self.start_goto((float(lm.position[0]), float(lm.position[1])),
                             lm.id, lm.label)
         elif 'tag_id' in req:
-            xy = by_tag(self.tag_map, req['tag_id'])
-            if xy is None:
+            # stop in front of the tag, looking at it — not at the wall it
+            # hangs on, where the camera cannot even see it
+            spot = tag_standoff(self.tag_map, req['tag_id'],
+                                self.tag_standoff_m)
+            if spot is None:
                 h.send_response(404); h.end_headers(); return
-            self.start_goto(xy, None, f"tag{req['tag_id']}")
+            self.start_goto(spot[0], None, f"tag{req['tag_id']}",
+                            final_yaw=spot[1])
         elif 'xy' in req:
             self.start_goto(tuple(req['xy']), None, req.get('label', 'point'))
         else:
             h.send_response(400); h.end_headers(); return
+        h.send_response(200); h.end_headers()
+
+    def _handle_seek(self, h):
+        import json as _json
+        n = int(h.headers.get('Content-Length', 0))
+        req = _json.loads(h.rfile.read(n))
+        cls = req.get('target_class')
+        if not cls:
+            h.send_response(400); h.end_headers(); return
+        self.start_seek(cls)
         h.send_response(200); h.end_headers()
 
     def _handle_landmarks_list(self, h):
@@ -394,17 +456,25 @@ class SlamRunner:
 
     # ---- navigation lifecycle ------------------------------------------
 
-    def start_goto(self, goal_xy, goal_id, goal_label):
+    def start_goto(self, goal_xy, goal_id, goal_label, final_yaw=None):
         from slam.nav_session import NavSession
         # NavSession imported lazily so SlamRunner can be constructed without
         # the slam package; only used when --slam, which already imported it.
+        # Skip Pi events from before this goto (a previous session's trailing
+        # pulse_done / blocked must not be fed to the new NavSession).
+        self.pi_events.sync(self._get_pi_status())
         self.session_nav = NavSession(goal_xy=goal_xy, goal_id=goal_id,
                                       goal_label=goal_label,
-                                      config=self.nav_config)
+                                      config=self.nav_config,
+                                      final_yaw=final_yaw)
         print(f'[{time.time():.3f}] NAV start -> {goal_label} '
-              f'id={goal_id} at {goal_xy}')
+              f'id={goal_id} at {goal_xy}'
+              + ('' if final_yaw is None else f' facing {final_yaw:+.2f}rad'))
 
     def stop_goto(self):
+        if self.seek is not None:
+            print('SEEK stop')
+            self.seek = None
         if self.session_nav is not None:
             print('NAV stop')
             try:
@@ -422,7 +492,8 @@ class SlamRunner:
         # so the two logs can be aligned line-for-line.
         print(f'[{time.time():.3f}] NAV-> {cmd.kind:11s} '
               f'vx={cmd.vx:+.2f} vy={cmd.vy:+.2f} wz={cmd.wz:+.2f} '
-              f'sec={cmd.seconds:.2f}  state={self.session_nav.state.value}')
+              f'sec={cmd.seconds:.2f}  state={self.session_nav.state.value}'
+              f'  {self._nav_pose_text()}')
         try:
             self.http.post(self.cmd_url, json=payload, timeout=0.5)
         except Exception:                           # noqa: BLE001
@@ -434,50 +505,152 @@ class SlamRunner:
                     and self.session_nav.state is State.WAITING_PULSE):
                 self.session_nav.state = State.DRIVING
             return
-        # The robot turns at w_eff while wz only commands w_max — feed the
-        # dead-reckoner the REAL angular rate or its yaw estimate lags ~2x,
-        # heading error never converges and the robot spins forever.
-        rot_scale = (self.nav_config.w_eff / self.nav_config.w_max
-                     if self.nav_config.w_max else 1.0)
-        self.dead_reckoner.record_pulse(cmd.vx, cmd.vy, cmd.wz * rot_scale,
+        # Feed the dead-reckoner the yaw rate the motors REALLY produce, not
+        # the commanded wz. In place that is w_eff (~2.2x the command); as
+        # steering blended into a forward pulse it is only ~0.6x, because the
+        # duty floor swallows most of the left/right difference. Scaling
+        # every pulse by the in-place factor made the reckoner believe a
+        # steered forward pulse had turned ~80 deg, and nav then "corrected"
+        # a turn that never happened.
+        from slam.dead_reckoner import modeled_yaw_rate
+        yaw_rate = modeled_yaw_rate(cmd.vx, cmd.vy, cmd.wz,
+                                    self.nav_config.w_max,
+                                    self.nav_config.w_eff)
+        self.dead_reckoner.record_pulse(cmd.vx, cmd.vy, yaw_rate,
                                         cmd.seconds, now)
 
-    def _drain_pi_events(self):
-        if self.session_nav is None:
-            return
-        try:
-            r = self.http.get(self.event_url, timeout=0.5)
-            if r.status_code != 200:
+    def _nav_pose_text(self):
+        pose, located, stale = getattr(self, '_nav_pose_dbg',
+                                       (None, False, True))
+        if pose is None:
+            return 'pose=none'
+        gx, gy = self.session_nav.goal_xy
+        src = 'tag' if located else ('stale' if stale else 'dr')
+        return (f'pose=({pose[0]:+.2f},{pose[1]:+.2f},{pose[2]:+.2f}rad) '
+                f'[{src}] goal_dist='
+                f'{((gx - pose[0]) ** 2 + (gy - pose[1]) ** 2) ** 0.5:.2f}m')
+
+    def _feed_nav_events(self, events, now):
+        for event in events:
+            if self.session_nav is None:            # stopped mid-drain
                 return
-            event = r.json().get('event') or ''
-        except Exception:                           # noqa: BLE001
-            return
-        if event:
             before = self.session_nav.state.value
             self.session_nav.on_pi_event(event)
             print(f'[{time.time():.3f}] NAV<- event={event:16s} '
                   f'{before} -> {self.session_nav.state.value}')
             if self.session_nav.state.value in ('ARRIVED', 'FAILED'):
-                self._publish_nav_done()
+                self._publish_nav_done(now)
+                return
 
-    def _publish_nav_done(self):
-        reason = (self.session_nav.fail_reason
-                  if self.session_nav.state.value == 'FAILED' else None)
-        ev = {'event': 'nav_done',
-              'state': self.session_nav.state.value,
-              'goal_label': self.session_nav.goal_label,
-              'goal_id': self.session_nav.goal_id,
-              'reason': reason}
-        print(f'[{time.time():.3f}] NAV result: {ev}')
-        with self._nav_done_lock:
-            self._nav_done_event = ev
-        if self.session_nav.state.value == 'FAILED':
+    def _get_pi_status(self):
+        try:
+            r = self.http.get(self.event_url, timeout=0.5)
+            return r.json() if r.status_code == 200 else None
+        except Exception:                           # noqa: BLE001
+            return None
+
+    def _publish_nav_done(self, now):
+        nav = self.session_nav
+        self.session_nav = None
+        failed = nav.state.value == 'FAILED'
+        if failed:
             try:
                 self.http.post(self.cmd_url,
                                json={'action': 'nav_stop'}, timeout=0.5)
             except Exception:
                 pass
+        from slam.seek_session import SeekState
+        if self.seek is not None and self.seek.state is SeekState.NAV:
+            # This goto was a leg of a class seek — the seek decides what the
+            # result means (arrived-and-seen vs stale landmark vs retry).
+            print(f'[{time.time():.3f}] SEEK nav leg -> {nav.state.value}'
+                  f'{" (" + str(nav.fail_reason) + ")" if failed else ""}')
+            seek = self.seek
+            self._run_seek_actions(seek, seek.on_nav_done(
+                nav.state.value, now, self._hits(seek.target_class)))
+            return
+        # A map arrival is only "really there" if the object is in sight.
+        # ``seen`` is None for goals with no object class (tags, raw points).
+        seen = (self._seen_recently(nav.goal_label, now)
+                if nav.goal_id is not None else None)
+        ev = {'event': 'nav_done',
+              'state': nav.state.value,
+              'goal_label': nav.goal_label,
+              'goal_id': nav.goal_id,
+              'reason': nav.fail_reason if failed else None,
+              'seen': seen}
+        print(f'[{time.time():.3f}] NAV result: {ev}')
+        with self._nav_done_lock:
+            self._nav_done_event = ev
+
+    # ---- class seek: map navigation + visual search as one behaviour ----
+
+    def start_seek(self, target_class):
+        from slam.seek_session import SeekSession
         self.session_nav = None
+        with self._nav_done_lock:
+            self._nav_done_event = None
+        self.seek = SeekSession(target_class)
+        print(f'[{time.time():.3f}] SEEK start -> {target_class}')
+
+    def _seek_candidates(self, cls):
+        from slam.landmark_selector import by_class
+        robot = self.last_robot or (0.0, 0.0, 0.0)
+        return [{'id': lm.id, 'label': lm.label,
+                 'x': float(lm.position[0]), 'y': float(lm.position[1])}
+                for lm in by_class(self.smap, cls, (robot[0], robot[1]),
+                                   conf_min=self.landmark_conf_min)]
+
+    def _post_pi(self, cmd):
+        try:
+            self.http.post(self.cmd_url, json=cmd, timeout=0.5)
+        except Exception:                           # noqa: BLE001
+            print(f'warning: could not send {cmd} to Pi')
+
+    def _run_seek_actions(self, seek, actions):
+        for act in actions:
+            sight = self._class_sight.get(seek.target_class)
+            sight_txt = ('never' if sight is None else
+                         f"{time.time() - sight['t']:.1f}s ago "
+                         f"h={sight['h_frac']:.2f}"
+                         f"{' clipped' if sight['clipped'] else ''}")
+            print(f'[{time.time():.3f}] SEEK-> {act[0]:10s} '
+                  f'state={seek.state.value}  last_sight={sight_txt}  '
+                  f'trail={seek.trail}')
+            if act[0] == 'find':
+                self._post_pi({'action': 'find', 'target': act[1]})
+            elif act[0] == 'goto':
+                lm = act[1]
+                self.start_goto((lm['x'], lm['y']), lm['id'], lm['label'])
+            elif act[0] == 'nav_cancel':
+                self.session_nav = None     # the next `find` takes the Pi over
+            elif act[0] == 'stop':
+                self._post_pi({'action': 'stop'})
+
+    def _tick_seek(self, seek, events, now):
+        for event in events:
+            seek.on_pi_event(event)
+        if not seek.done:
+            cls = seek.target_class
+            self._run_seek_actions(seek, seek.tick(
+                now, self._hits(cls), self._seek_candidates(cls),
+                self._class_sight.get(cls)))
+        if seek.done:
+            arrived = seek.state.value == 'ARRIVED'
+            ev = {'event': 'nav_done',
+                  'state': seek.state.value,
+                  'goal_label': seek.target_class,
+                  'goal_id': seek.goal_id if seek.via == 'map' else None,
+                  'reason': seek.fail_reason,
+                  'seen': True if arrived else None,
+                  'via': seek.via,
+                  'unseen_ids': list(seek.unseen_ids),
+                  'trail': list(seek.trail)}
+            print(f'[{time.time():.3f}] SEEK result: {ev}')
+            with self._nav_done_lock:
+                self._nav_done_event = ev
+            if self.seek is seek:
+                self.seek = None
 
 
 def main():
@@ -540,6 +713,9 @@ def main():
     ap.add_argument('--scan-max-rotations', type=int, default=12,
                     help='scan steps before FAILED(lost); 12 x 30deg = 360deg')
     ap.add_argument('--landmark-conf-min', type=float, default=0.7)
+    ap.add_argument('--tag-standoff-m', type=float, default=1.0,
+                    help='tag goals (回原点/绕室) stop this far in front of '
+                         'the tag, facing it, so the tag stays in view')
     args = ap.parse_args()
 
     snapshot_url = f'http://{args.pi}:{args.stream_port}/snapshot'
@@ -574,6 +750,7 @@ def main():
             'block_retries': args.block_retries,
             'scan_max_rotations': args.scan_max_rotations,
             'landmark_conf_min': args.landmark_conf_min,
+            'tag_standoff_m': args.tag_standoff_m,
         }
         try:
             slam = SlamRunner(args.pi, args.semantic_port, args.map_port,
@@ -679,8 +856,10 @@ def main():
             frames += 1
             now = time.time()
             if now - last_log >= 5.0:
+                seen = ','.join(f"{d['cls']}:{d['score']:.2f}" for d in dets)
                 print(f'fps={frames / (now - last_log):.1f}  '
-                      f'last_dets={len(dets)}{slam_info}')
+                      f'last_dets={len(dets)}'
+                      f'{" [" + seen + "]" if seen else ""}{slam_info}')
                 frames = 0
                 last_log = now
     except KeyboardInterrupt:

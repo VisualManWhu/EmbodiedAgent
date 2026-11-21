@@ -39,6 +39,24 @@ def nearest_by_class(smap, cls, robot_xy, **kw):
     return cands[0] if cands else None
 
 
+def tag_standoff(tag_map, tag_id, standoff_m: float):
+    """Where to stop to LOOK at an AprilTag: ``((x, y), final_yaw)`` — the
+    point ``standoff_m`` out along the tag's face normal, heading back at the
+    tag. None if the tag is unknown.
+
+    A tag is on a wall, so its own (x, y) is unreachable, and from right
+    underneath it the low camera cannot see it at all.
+    """
+    e = tag_map.get(int(tag_id))
+    if e is None:
+        return None
+    normal = math.radians(float(e.get('yaw_deg', 0.0)))
+    x = float(e['x']) + standoff_m * math.cos(normal)
+    y = float(e['y']) + standoff_m * math.sin(normal)
+    facing = math.atan2(-math.sin(normal), -math.cos(normal))
+    return (x, y), facing
+
+
 def by_tag(tag_map, tag_id):
     """``(x, y)`` of an AprilTag from the tag map, or None."""
     e = tag_map.get(int(tag_id))

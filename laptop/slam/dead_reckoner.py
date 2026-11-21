@@ -31,10 +31,26 @@ class DeadReckoner:
         self.pulses: list[_Pulse] = []
 
     def reset(self, pose, t: float):
-        """Snap the reckoner to a known pose and clear the pulse buffer."""
+        """Snap the reckoner to a known pose at time ``t``.
+
+        Motion already executed before ``t`` is baked into the new pose, so
+        it is dropped — but the part of a pulse that runs on AFTER ``t`` is
+        kept. A tag fix routinely lands just after a pulse is issued (the tag
+        is still in view while the motors ramp up); discarding that pulse
+        made the reckoner report the pre-move pose once the tag left the
+        frame, and nav re-issued the same rotation.
+        """
+        t = float(t)
         self.last_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
-        self.last_t = float(t)
-        self.pulses.clear()
+        self.last_t = t
+        remaining = []
+        for p in self.pulses:
+            end = p.started_at + p.seconds
+            if end <= t:
+                continue                            # fully executed already
+            start = max(p.started_at, t)
+            remaining.append(_Pulse(p.vx, p.vy, p.wz, end - start, start))
+        self.pulses = remaining
 
     def record_pulse(self, vx: float, vy: float, wz: float,
                      seconds: float, started_at: float):
@@ -67,3 +83,39 @@ class DeadReckoner:
         x0, y0, _ = self.last_pose
         stale = math.hypot(x - x0, y - y0) > self.distance_limit_m
         return (x, y, yaw), stale
+
+
+def modeled_yaw_rate(vx: float, vy: float, wz: float,
+                     w_cmd_ref: float, w_eff: float,
+                     wheel_half_sum_m: float = 0.165,
+                     speed_gain: float = 200.0,
+                     min_pct: float = 30.0, max_pct: float = 45.0,
+                     move_eps: float = 0.01) -> float:
+    """Yaw rate (rad/s) the robot actually achieves for a commanded twist.
+
+    Mirrors ``motor_node``: mecanum mixing -> wheel_norm * speed_gain ->
+    duty percent clamped to [min_pct, max_pct] (the floor exists to overcome
+    motor stall). The clamp makes the response very non-linear: an in-place
+    turn commanded at 0.5 rad/s runs every wheel at the floor and really
+    turns at ~1.12 rad/s, while the same wz blended into a forward pulse only
+    produces the small left/right duty DIFFERENCE left after the floor.
+
+    Calibrated against the one hand-measured point: an in-place turn at
+    ``w_cmd_ref`` yields ``w_eff``. Yaw rate is taken as proportional to the
+    right-minus-left duty difference. The defaults mirror the Pi's
+    params.yaml (wheel_base_lx + ly, speed_gain, min/max_move_percent).
+    """
+    def duty(w):
+        if abs(w) < move_eps:
+            return 0.0
+        pct = max(min_pct, min(max_pct, abs(w) * speed_gain))
+        return pct if w > 0 else -pct
+
+    k = wz * wheel_half_sum_m
+    fl, fr = vx - vy - k, vx + vy + k
+    rl, rr = vx + vy - k, vx - vy + k
+    diff = (duty(fr) + duty(rr) - duty(fl) - duty(rl)) / 4.0
+    ref = duty(abs(w_cmd_ref) * wheel_half_sum_m)       # in-place duty
+    if ref == 0.0:
+        return 0.0
+    return w_eff * diff / ref

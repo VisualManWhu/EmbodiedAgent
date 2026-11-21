@@ -44,8 +44,12 @@ class NavConfig:
     # motion-blur-free frames to re-localize before the next pulse.
     nav_dwell_sec: float = 2.0
     strafe_speed: float = 0.15
-    strafe_seconds: float = 0.6
-    avoid_forward_seconds: float = 0.8
+    # Side-step per block. The Nth consecutive block strafes N x this long
+    # (capped), i.e. ~15 cm, then ~30 cm: a fixed 9 cm step three times in a
+    # row never got around a real obstacle in the field.
+    strafe_seconds: float = 1.0
+    strafe_max_seconds: float = 3.0
+    avoid_forward_seconds: float = 1.5
     blocked_backup_sec: float = 1.0          # reverse for clearance per block
     block_retries: int = 3
     # after block_retries side-steps fail, don't give up: back up and re-plan.
@@ -63,6 +67,12 @@ class NavConfig:
     # arrived_radius because the ultrasonic trips on the object SURFACE while
     # the goal landmark is its CENTRE.
     blocked_arrival_dist_m: float = 1.0
+    # goals with a final heading (tag goals: end up LOOKING at the tag):
+    # once inside the arrival radius, turn in place until within this
+    # tolerance. Open-loop turns overshoot, so allow a few corrective tries
+    # and then arrive regardless rather than hunt forever.
+    final_heading_tol_rad: float = 0.3
+    final_face_max: int = 3
 
 
 @dataclass
@@ -93,6 +103,10 @@ class NavSession:
     _drive_resume_t: float | None = None     # dwell-until time after a pulse
     # obstacle-vs-target discrimination for a blocked:front event
     _target_ahead: bool = False              # camera sees the goal class close
+    # heading to end at (map frame, rad), or None = any heading will do
+    final_yaw: float | None = None
+    _facing: bool = False                    # position reached, now turning
+    _face_count: int = 0
     _last_goal_dist: float = float('inf')    # map distance at the last tick
 
     def on_tag_fix(self, t: float):
@@ -156,15 +170,22 @@ class NavSession:
         elif side == 'right':
             vy = +self.config.strafe_speed
         else:                                       # 'front' or unknown
-            vy = +self.config.strafe_speed         # default: try left
+            # No side information: try left first, and switch sides after
+            # each failed recovery cycle instead of repeating the same one.
+            sign = 1.0 if self.recovery_count % 2 == 0 else -1.0
+            vy = sign * self.config.strafe_speed
+        # Escalate: each consecutive block steps further sideways.
+        strafe_sec = min(self.config.strafe_seconds * self.block_count,
+                         self.config.strafe_max_seconds)
+        # A new block supersedes whatever was left of the previous manoeuvre.
+        self.queued.clear()
         # Back up first for clearance, then strafe away, then resume forward.
         # The reverse step matters because the narrow front ultrasonic beam
         # can lose a still-present obstacle after only a small strafe.
         self.queued.append(NavCommand(-self.config.v_max, 0.0, 0.0,
                                       self.config.blocked_backup_sec,
                                       'backward'))
-        self.queued.append(NavCommand(0.0, vy, 0.0,
-                                      self.config.strafe_seconds, 'strafe'))
+        self.queued.append(NavCommand(0.0, vy, 0.0, strafe_sec, 'strafe'))
         self.queued.append(NavCommand(self.config.v_max, 0.0, 0.0,
                                       self.config.avoid_forward_seconds,
                                       'forward'))
@@ -212,7 +233,29 @@ class NavSession:
         dx, dy = self.goal_xy[0] - x, self.goal_xy[1] - y
         dist = math.hypot(dx, dy)
         self._last_goal_dist = dist
-        if dist < self.config.arrived_radius_m:
+        if self._facing or dist < self.config.arrived_radius_m:
+            settling = (self._drive_resume_t is not None
+                        and now < self._drive_resume_t)
+            if self._facing and settling:
+                return None             # let the last facing turn settle
+            if (self.final_yaw is not None
+                    and self._face_count < self.config.final_face_max):
+                err = _wrap(self.final_yaw - yaw)
+                if abs(err) > self.config.final_heading_tol_rad:
+                    if settling:
+                        return None
+                    # Position reached; from here on only turn — never drive
+                    # off again because the turn nudged us out of the radius.
+                    self._facing = True
+                    self._face_count += 1
+                    wz = self.config.w_max * (1.0 if err > 0 else -1.0)
+                    sec = _clamp(abs(err) / self.config.w_eff,
+                                 self.config.min_pulse_sec,
+                                 self.config.max_pulse_sec)
+                    self._drive_resume_t = (now + sec
+                                            + self.config.nav_dwell_sec)
+                    self.state = State.WAITING_PULSE
+                    return NavCommand(0.0, 0.0, wz, sec, 'rotate')
             self.state = State.ARRIVED
             return NavCommand(0.0, 0.0, 0.0, 0.0, 'stop')
 

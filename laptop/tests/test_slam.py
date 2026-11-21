@@ -360,3 +360,15 @@ def test_persistence_roundtrip(tmp_path):
     assert b.label == a.label
     assert np.allclose(b.position, a.position)
     assert b.obs_count == a.obs_count
+
+
+def test_detection_projected_absurdly_far_is_rejected():
+    """Field bug: a bbox whose bottom edge sits near the horizon intersects
+    the ground hundreds of metres away. One such landmark at (96, -278) blew
+    the rendered map up to 31070 x 10662 px."""
+    smap = SemanticMap()
+    far = np.array([120.0, 3.0, 0.0])
+    assert _observe(smap, far, (0.0, 0.0, 0.5)) is None
+    assert len(smap.landmarks) == 0
+    near = np.array([3.0, 0.5, 0.0])
+    assert _observe(smap, near, (0.0, 0.0, 0.5)) is not None

@@ -59,3 +59,17 @@ def test_by_tag_returns_xy_or_none():
     tag_map = {0: {'x': 0.0, 'y': 0.0, 'z': 0.3, 'yaw_deg': 0.0, 'size_m': 0.1}}
     assert by_tag(tag_map, 0) == (0.0, 0.0)
     assert by_tag(tag_map, 9) is None
+
+
+def test_tag_standoff_is_in_front_of_the_tag_facing_it():
+    import math
+    from slam.landmark_selector import tag_standoff
+    tag_map = {0: {'x': 0.0, 'y': 0.0, 'yaw_deg': 90.0},     # faces +y
+               5: {'x': 5.0, 'y': 1.0, 'yaw_deg': 180.0}}    # faces -x
+    xy, yaw = tag_standoff(tag_map, 0, 1.0)
+    assert xy == pytest.approx((0.0, 1.0), abs=1e-9)
+    assert yaw == pytest.approx(-math.pi / 2)                # looking at -y
+    xy, yaw = tag_standoff(tag_map, 5, 0.8)
+    assert xy == pytest.approx((4.2, 1.0), abs=1e-9)
+    assert abs(yaw) == pytest.approx(0.0, abs=1e-9)          # looking at +x
+    assert tag_standoff(tag_map, 99, 1.0) is None
