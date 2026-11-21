@@ -109,6 +109,7 @@ class SlamRunner:
               f'miss={cfg.miss_demote}/{cfg.miss_prune}')
         self.tag_detector = AprilTagDetector()
         mount = {'forward_m': 0.0, 'lateral_m': 0.0, 'height_m': cam_height_m}
+        self.cam_height_m = cam_height_m
         self.pose_est = PoseEstimator(self.tag_map, self.K, self.dist, mount)
 
         self.map_json_path = map_json_path
@@ -173,8 +174,9 @@ class SlamRunner:
         self._last_pan = 0.0
         self._deferred_done = None          # (event, since) awaiting camera
         if nav_overrides.get('pan_aim', True):
-            from slam.tag_aimer import TagAimer
-            self.aimer = TagAimer(self.tag_map)
+            from slam.tag_aimer import AimConfig, TagAimer
+            self.aimer = TagAimer(self.tag_map,
+                                  AimConfig(cam_height_m=cam_height_m))
             # A camera sweep covers ~200 deg, so when it finds nothing the
             # chassis should turn far, not creep round in 30 deg steps.
             self.nav_config.scan_rotate_rad = math.radians(150.0)
@@ -254,6 +256,7 @@ class SlamRunner:
             # for the NAV-> log line: where nav believes the robot is
             self._nav_pose_dbg = (robot_pose, located, pose_stale)
             self._nav_yaw_ok = bool(located and pose.get('yaw_reliable', True))
+            self._nav_fix_tag = pose.get('rotation_tag') if located else None
             hold = self._tick_aimer(now, robot_pose, pose_stale)
             cmd = None
             if not hold:
@@ -539,7 +542,8 @@ class SlamRunner:
             # stop in front of the tag, looking at it — not at the wall it
             # hangs on, where the camera cannot even see it
             spot = tag_standoff(self.tag_map, req['tag_id'],
-                                self.tag_standoff_m)
+                                self.tag_standoff_m,
+                                cam_height_m=self.cam_height_m)
             if spot is None:
                 h.send_response(404); h.end_headers(); return
             self.start_goto(spot[0], None, f"tag{req['tag_id']}",
@@ -652,6 +656,7 @@ class SlamRunner:
         gx, gy = self.session_nav.goal_xy
         # 'tag~' = fix from a tag seen face-on: position good, heading shaky
         src = (('tag' if getattr(self, '_nav_yaw_ok', True) else 'tag~')
+               + str(getattr(self, '_nav_fix_tag', '') or '')
                if located else ('stale' if stale else 'dr'))
         return (f'pose=({pose[0]:+.2f},{pose[1]:+.2f},{pose[2]:+.2f}rad) '
                 f'[{src}] goal_dist='

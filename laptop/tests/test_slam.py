@@ -438,7 +438,8 @@ def test_orientation_comes_from_the_oblique_tag_not_the_lowest_error_one():
 
 
 def test_pose_reports_whether_its_heading_is_trustworthy():
-    est = PoseEstimator(OBLIQUE_MAP, K)
+    est = PoseEstimator(OBLIQUE_MAP, K, mount={
+        'forward_m': 0.0, 'lateral_m': 0.0, 'height_m': CAM_TRUE[2, 3]})
     face_on = est.estimate([{'id': 10,
                              'corners': _corners(CAM_TRUE, 10, OBLIQUE_MAP)}])
     assert face_on['yaw_reliable'] is False
@@ -450,3 +451,50 @@ def test_pose_reports_whether_its_heading_is_trustworthy():
         {'id': 10, 'corners': _corners(CAM_TRUE, 10, OBLIQUE_MAP)},
         {'id': 11, 'corners': _corners(CAM_TRUE, 11, OBLIQUE_MAP)}])
     assert both['yaw_reliable'] is True
+
+
+# --------------------------------------------------------------------------
+# pose_estimator: reject physically impossible fixes
+# --------------------------------------------------------------------------
+
+def test_fix_that_puts_the_camera_at_an_impossible_height_is_rejected():
+    """The camera rides ~15 cm above the floor, always. Field data: every
+    wrong planar-pose solution put it at 0.30-0.86 m, every right one at
+    0.10-0.21 m. During a room tour such fixes threw the pose 3 m back and
+    forth, one of them outside the room."""
+    good = CAM_TRUE.copy()
+    good[2, 3] = 0.15
+    floating = CAM_TRUE.copy()
+    floating[2, 3] = 0.45
+    est = PoseEstimator(OBLIQUE_MAP, K, mount={'forward_m': 0.0,
+                                               'lateral_m': 0.0,
+                                               'height_m': 0.15})
+    assert est.estimate([{'id': 11,
+                          'corners': _corners(good, 11, OBLIQUE_MAP)}])
+    assert est.estimate([{'id': 11,
+                          'corners': _corners(floating, 11, OBLIQUE_MAP)}]) \
+        is None
+
+
+def test_impossible_tag_is_dropped_but_a_sane_one_still_gives_a_fix():
+    good = CAM_TRUE.copy()
+    good[2, 3] = 0.15
+    floating = CAM_TRUE.copy()
+    floating[2, 3] = 0.45
+    est = PoseEstimator(OBLIQUE_MAP, K, mount={'forward_m': 0.0,
+                                               'lateral_m': 0.0,
+                                               'height_m': 0.15})
+    pose = est.estimate([
+        {'id': 10, 'corners': _corners(floating, 10, OBLIQUE_MAP)},
+        {'id': 11, 'corners': _corners(good, 11, OBLIQUE_MAP)}])
+    assert pose['n_tags'] == 1 and pose['rotation_tag'] == 11
+    assert pose['n_rejected'] == 1
+    assert abs(pose['T_map_cam'][2, 3] - 0.15) < 0.01
+
+
+def test_height_check_is_off_unless_a_camera_height_is_given():
+    floating = CAM_TRUE.copy()
+    floating[2, 3] = 0.45
+    assert estimate_camera_pose(
+        [{'id': 11, 'corners': _corners(floating, 11, OBLIQUE_MAP)}],
+        OBLIQUE_MAP, K) is not None

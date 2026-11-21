@@ -73,3 +73,25 @@ def test_tag_standoff_is_in_front_of_the_tag_facing_it():
     assert xy == pytest.approx((4.2, 1.0), abs=1e-9)
     assert abs(yaw) == pytest.approx(0.0, abs=1e-9)          # looking at +x
     assert tag_standoff(tag_map, 99, 1.0) is None
+
+
+def test_standoff_stretches_for_a_tag_mounted_too_high_to_see_up_close():
+    from slam.landmark_selector import min_view_distance, tag_standoff
+    tag_map = {0: {'x': 0.0, 'y': 0.0, 'z': 0.30, 'size_m': 0.11,
+                   'yaw_deg': 90.0},
+               5: {'x': 5.0, 'y': 1.0, 'z': 0.54, 'size_m': 0.11,
+                   'yaw_deg': 180.0}}
+    # low tag: 1 m is (just) enough
+    xy, _ = tag_standoff(tag_map, 0, 1.0, cam_height_m=0.15)
+    assert 1.0 <= xy[1] < 1.15
+    # high tag: must back off to about 2.3 m
+    xy, yaw = tag_standoff(tag_map, 5, 1.0, cam_height_m=0.15)
+    need = min_view_distance(tag_map[5], 0.15)
+    assert 2.0 < need < 2.2
+    assert 5.0 - xy[0] == pytest.approx(1.1 * need)
+    assert abs(yaw) == pytest.approx(0.0, abs=1e-9)      # still facing it
+    # without a camera height the plain distance is used, as before
+    xy, _ = tag_standoff(tag_map, 5, 1.0)
+    assert xy == pytest.approx((4.0, 1.0), abs=1e-9)
+    # a tag at or below camera height needs no extra distance
+    assert min_view_distance({'z': 0.10, 'size_m': 0.08}, 0.15) == 0.0

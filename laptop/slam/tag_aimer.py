@@ -21,6 +21,8 @@ servo needs a moment to get there, and a pose solved mid-swing is wrong.
 import math
 from dataclasses import dataclass, field
 
+from .landmark_selector import min_view_distance
+
 
 def _wrap(a: float) -> float:
     return math.atan2(math.sin(a), math.cos(a))
@@ -38,6 +40,9 @@ class AimConfig:
     # 0.4-0.9 m against the previous tag.
     max_range_m: float = 2.6
     max_incidence_rad: float = math.radians(72.0)
+    # camera height above the floor; a tag mounted well above it leaves the
+    # top of the view when the robot is close (see min_view_distance)
+    cam_height_m: float = 0.15
     # leave the current tag only for a clearly better one
     switch_margin: float = 1.3
     retarget_min_rad: float = math.radians(6.0)
@@ -79,6 +84,8 @@ class TagAimer:
         cfg = self.config
         if not (cfg.min_range_m <= d <= cfg.max_range_m):
             return 0.0, 0.0
+        if d < min_view_distance(e, cfg.cam_height_m):
+            return 0.0, 0.0                  # too close: it is above the view
         pan = _wrap(math.atan2(dy, dx) - yaw)
         if abs(pan) > cfg.pan_limit_rad:
             return 0.0, pan

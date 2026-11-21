@@ -231,17 +231,34 @@ def _fetch_list(path):
         return {}
 
 
-def _wait_for_nav_done(timeout_sec):
+class _Superseded(Exception):
+    """A newer command (e.g. `停`) has replaced the one this thread serves."""
+
+
+def _wait_for_nav_done(timeout_sec, gen=None):
+    """Wait for the detector's goto result. Raises ``_Superseded`` as soon as
+    a newer command arrives — the multi-leg tours must END then, not time out
+    on this leg and drive on to the next one minutes after the operator said
+    stop (which is exactly what happened in the field)."""
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         time.sleep(0.7)
+        if gen is not None and not _watch_alive(gen):
+            raise _Superseded()
         ev = poll_nav_done()
         if ev:
             return ev
     return None
 
 
-def _run_patrol(loop, context, chat_id):
+def _run_patrol(loop, context, chat_id, gen=None):
+    try:
+        _patrol(loop, context, chat_id, gen)
+    except _Superseded:
+        pass                        # stopped by the operator: say nothing more
+
+
+def _patrol(loop, context, chat_id, gen):
     import asyncio
     data = _fetch_list('nav/landmarks')
     landmarks = data.get('landmarks', [])
@@ -253,9 +270,11 @@ def _run_patrol(loop, context, chat_id):
         asyncio.run_coroutine_threadsafe(
             context.bot.send_message(chat_id,
                 f"前往 {lm['label']} id {lm['id']} ..."), loop)
+        if gen is not None and not _watch_alive(gen):
+            raise _Superseded()
         if not start_goto_id(lm['id']):
             continue
-        ev = _wait_for_nav_done(180.0)
+        ev = _wait_for_nav_done(180.0, gen)
         if ev is None or ev.get('state') != 'ARRIVED':
             asyncio.run_coroutine_threadsafe(
                 context.bot.send_message(chat_id,
@@ -269,7 +288,14 @@ def _run_patrol(loop, context, chat_id):
         context.bot.send_message(chat_id, '巡逻完成'), loop)
 
 
-def _run_room_tour(loop, context, chat_id):
+def _run_room_tour(loop, context, chat_id, gen=None):
+    try:
+        _room_tour(loop, context, chat_id, gen)
+    except _Superseded:
+        pass                        # stopped by the operator: say nothing more
+
+
+def _room_tour(loop, context, chat_id, gen):
     import asyncio
     data = _fetch_list('nav/tags')
     tags = sorted(data.get('tags', []), key=lambda t: t['id'])
@@ -280,9 +306,11 @@ def _run_room_tour(loop, context, chat_id):
     for t in tags:
         asyncio.run_coroutine_threadsafe(
             context.bot.send_message(chat_id, f"前往 tag {t['id']} ..."), loop)
+        if gen is not None and not _watch_alive(gen):
+            raise _Superseded()
         if not start_goto_tag(t['id']):
             continue
-        ev = _wait_for_nav_done(180.0)
+        ev = _wait_for_nav_done(180.0, gen)
         if ev is None or ev.get('state') != 'ARRIVED':
             asyncio.run_coroutine_threadsafe(
                 context.bot.send_message(chat_id,
@@ -410,14 +438,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cmd['action'] == 'patrol':
         await context.bot.send_message(chat_id, '开始巡逻 ...')
         threading.Thread(target=_run_patrol, args=(
-            __import__('asyncio').get_running_loop(), context, chat_id),
+            __import__('asyncio').get_running_loop(), context, chat_id, gen),
             daemon=True).start()
         return
 
     if cmd['action'] == 'room_tour':
         await context.bot.send_message(chat_id, '开始绕室 ...')
         threading.Thread(target=_run_room_tour, args=(
-            __import__('asyncio').get_running_loop(), context, chat_id),
+            __import__('asyncio').get_running_loop(), context, chat_id, gen),
             daemon=True).start()
         return
 

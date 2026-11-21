@@ -149,3 +149,23 @@ def test_reset_recentres_bookkeeping():
     a.reset()
     assert a.pan_cmd == 0.0 and a.target_id is None
     assert not a.settling(0.1)
+
+
+def test_high_tag_is_not_aimed_at_from_close_up():
+    """Field result: tag 5 (top edge 0.59 m) was aimed at twice from ~1.4 m
+    and never seen — at that range it is above the top of the camera's view.
+    The same tag is fine from across the room."""
+    tags = {5: {'x': 0.0, 'y': 0.0, 'z': 0.54, 'size_m': 0.11,
+                'yaw_deg': 0.0}}
+    a = TagAimer(tags, AimConfig(cam_height_m=0.15))
+    close = (1.2, 0.9, DEG(180))            # ~1.5 m away
+    far = (2.0, 1.2, DEG(180))              # ~2.3 m away
+    assert a.score(5, close)[0] == 0.0
+    assert a.score(5, far)[0] > 0.0
+
+
+def test_low_tag_is_still_usable_from_one_metre():
+    tags = {0: {'x': 0.0, 'y': 0.0, 'z': 0.30, 'size_m': 0.11,
+                'yaw_deg': 0.0}}
+    a = TagAimer(tags, AimConfig(cam_height_m=0.15))
+    assert a.score(0, (0.8, 0.7, DEG(180)))[0] > 0.0     # ~1.06 m away
