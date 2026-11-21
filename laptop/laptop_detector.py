@@ -84,7 +84,7 @@ class SlamRunner:
     top-down map, POSTs it to the Pi semantic_map_node, and persists the map.
     """
 
-    RENDER_INTERVAL = 1.0
+    RENDER_INTERVAL = 0.3               # the map doubles as a live nav view
     POST_INTERVAL = 1.0
     SAVE_INTERVAL = 15.0
 
@@ -103,6 +103,9 @@ class SlamRunner:
         for k, v in (fusion_overrides or {}).items():
             if v is not None:
                 setattr(cfg, k, v)
+        if len(self.tag_map) >= 3:
+            from slam.landmark_selector import tag_bounds
+            cfg.bounds = tag_bounds(self.tag_map)
         print(f'fusion: gate={cfg.gate_radius_m}m  '
               f'confirm>={cfg.confirm_min_obs}obs/{cfg.confirm_min_viewpoints}views  '
               f'stale={cfg.tentative_stale_sec}s  '
@@ -183,6 +186,13 @@ class SlamRunner:
         self._last_fix = None               # (t, pose, tag id, yaw_reliable)
         # Stuck detection: was the last forward pulse followed by motion?
         self._stuck = None                  # StuckCheck for the pulse in flight
+        # Live navigation view: best current pose and how it was obtained,
+        # and the latest rendered map for the on-screen window.
+        self._live_pose = None
+        self._live_src = 'stale'
+        self._live_fix_t = None
+        self.map_img = None
+        self.camera_ok = True               # frames are arriving from the Pi
         self._cur_sig = None                # band-passed view of this frame
         self._cal = None                    # the pulse being measured
         self._last_block = None             # (t, pose) of the last block
@@ -329,6 +339,7 @@ class SlamRunner:
             if (self.session_nav is not None
                     and self.session_nav.state.value in ('ARRIVED', 'FAILED')):
                 self._publish_nav_done(now)
+            self._note_live_pose(robot_pose, located, pose_stale, now)
             if self.session_nav is not None:
                 nav_status = self.session_nav.state.value
                 if self.aimer is not None:
@@ -337,6 +348,9 @@ class SlamRunner:
                         f' cam={math.degrees(a.pan_cmd):+.0f}°'
                         + (f'->tag{a.target_id}' if a.target_id is not None
                            else ''))
+        else:
+            self._note_live_pose(
+                pose['base_xytheta'] if located else None, located, True, now)
         seek = self.seek            # local: an api thread may clear it
         if seek is not None:
             self._tick_seek(seek, events, now)
@@ -695,16 +709,88 @@ class SlamRunner:
                 return True
         return False
 
+    def _note_live_pose(self, pose, located, stale, now):
+        """Keep the best current estimate of where the robot is, for the
+        live view: a tag fix, else the dead-reckoned pose of an active goto,
+        else the last fix (shown as stale)."""
+        if located and pose is not None:
+            self._live_pose, self._live_src = tuple(pose), 'fix'
+            self._live_fix_t = now
+        elif pose is not None and self.session_nav is not None:
+            self._live_pose = tuple(pose)
+            self._live_src = 'stale' if stale else 'dr'
+        elif self._live_pose is None and self.last_robot is not None:
+            self._live_pose, self._live_src = self.last_robot, 'stale'
+        else:
+            self._live_src = 'stale' if self._live_src != 'fix' or (
+                self._live_fix_t is None or now - self._live_fix_t > 1.5
+            ) else 'fix'
+
+    def _nav_view(self, now):
+        """``(robot, source, route, goal, status_lines)`` for the map."""
+        robot = self._live_pose or self.last_robot
+        src = self._live_src if self._live_pose is not None else 'stale'
+        nav, seek = self.session_nav, self.seek
+        route = goal = None
+        lines = []
+        if nav is not None:
+            goal = (nav.goal_xy[0], nav.goal_xy[1], nav.goal_label or '')
+            if robot is not None:
+                dist = math.hypot(nav.goal_xy[0] - robot[0],
+                                  nav.goal_xy[1] - robot[1])
+                if nav.route_ready:
+                    route = [robot[:2]] + list(nav.waypoints) + [nav.goal_xy]
+                    legs = sum(math.dist(a, b)
+                               for a, b in zip(route, route[1:]))
+                    lines.append(f'NAV -> {goal[2]}   {legs:.1f} m along '
+                                 f'route ({dist:.1f} m direct)   '
+                                 f'[{nav.state.value}]')
+                else:
+                    lines.append(f'NAV -> {goal[2]}   {dist:.1f} m direct   '
+                                 f'[{nav.state.value}, no route yet]')
+            else:
+                lines.append(f'NAV -> {goal[2]}   [{nav.state.value}, '
+                             f'locating]')
+        if seek is not None:
+            lines.insert(0, f'SEEK {seek.target_class}   '
+                            f'[{seek.state.value}]')
+        if not lines:
+            lines.append('idle')
+        age = (None if self._live_fix_t is None
+               else now - self._live_fix_t)
+        if robot is None:
+            lines.append('pose: not localized yet')
+        elif src == 'fix':
+            lines.append('pose: tag fix')
+        elif src == 'dr':
+            lines.append(f'pose: dead reckoning, {age:.0f} s since the last '
+                         f'fix' if age is not None else
+                         'pose: dead reckoning')
+        else:
+            lines.append(f'pose: last fix {age:.0f} s ago' if age is not None
+                         else 'pose: stale')
+        return robot, src, route, goal, lines
+
+    def render_offline(self, now):
+        """Keep the map current while no camera frames arrive (Pi down or
+        unreachable): nothing can be localized, but the grid, the landmarks
+        and the last known position are still there to look at."""
+        self.camera_ok = False
+        if now - self._last_render < self.RENDER_INTERVAL:
+            return
+        self._last_render = now
+        self._note_live_pose(None, False, True, now)
+        self._render()
+
     def _render(self):
-        robot = self.last_robot
-        route = None
-        nav = self.session_nav
-        if nav is not None and nav.route_ready and robot is not None:
-            route = [robot[:2]] + list(nav.waypoints) + [nav.goal_xy]
+        robot, src, route, goal, lines = self._nav_view(time.time())
+        if not self.camera_ok:
+            lines.append('camera: no frames from the robot (Pi offline?)')
         img = self.renderer.render(
             self.tags_payload, self.smap.snapshot(), robot,
             grid=self.grid.snapshot() if self.grid is not None else None,
-            route=route)
+            route=route, robot_source=src, goal=goal, status=lines)
+        self.map_img = img
         self.map_server.set_image(img)
 
     def _post(self):
@@ -1128,6 +1214,10 @@ def main():
     ap.add_argument('--imgsz', type=int, default=640)
     ap.add_argument('--device', default='0', help="GPU index, or 'cpu'")
     ap.add_argument('--no-show', action='store_true', help='disable preview window')
+    ap.add_argument('--no-map-window', action='store_true',
+                    help='with --slam: do not open the live navigation map '
+                         'window (robot position and route over the '
+                         'semantic map)')
     # semantic SLAM
     _slam_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'slam')
     ap.add_argument('--slam', action='store_true',
@@ -1207,6 +1297,8 @@ def main():
     _start_annotated_server(args.annotated_port)
     print(f'annotated frames served at http://0.0.0.0:{args.annotated_port}/annotated')
 
+    MAP_WINDOW = 'navigation map (q=quit)'
+    map_window_open = False
     slam = None
     if args.slam:
         fusion_overrides = {
@@ -1263,11 +1355,28 @@ def main():
                 if stream_ok:
                     print('warning: lost connection to Pi camera stream')
                     stream_ok = False
+                # No frames, but the map is still worth looking at: keep the
+                # navigation window alive (and say why nothing is moving).
+                if slam is not None and not args.no_map_window:
+                    slam.render_offline(time.time())
+                    if slam.map_img is not None:
+                        if not map_window_open:
+                            cv2.namedWindow(MAP_WINDOW, cv2.WINDOW_NORMAL)
+                            h_img, w_img = slam.map_img.shape[:2]
+                            cv2.resizeWindow(MAP_WINDOW, int(w_img * 1.4),
+                                             int(h_img * 1.4))
+                            map_window_open = True
+                        cv2.imshow(MAP_WINDOW, slam.map_img)
+                        if cv2.waitKey(250) & 0xFF == ord('q'):
+                            break
+                        continue
                 time.sleep(0.3)
                 continue
             if r.status_code != 200:
                 time.sleep(0.1)
                 continue
+            if slam is not None:
+                slam.camera_ok = True
             if not stream_ok:
                 print('camera stream: OK')
                 stream_ok = True
@@ -1333,8 +1442,18 @@ def main():
                 except Exception as e:  # noqa: BLE001 - never kill detection
                     slam_info = f'  slam-error: {e}'
 
+            show_map = slam is not None and not args.no_map_window
+            if show_map and slam.map_img is not None:
+                if not map_window_open:
+                    cv2.namedWindow(MAP_WINDOW, cv2.WINDOW_NORMAL)
+                    h_img, w_img = slam.map_img.shape[:2]
+                    cv2.resizeWindow(MAP_WINDOW, int(w_img * 1.4),
+                                     int(h_img * 1.4))
+                    map_window_open = True
+                cv2.imshow(MAP_WINDOW, slam.map_img)
             if not args.no_show:
                 cv2.imshow('laptop detector (q=quit)', annotated)
+            if not args.no_show or show_map:
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 

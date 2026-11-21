@@ -38,6 +38,10 @@ class FusionConfig:
     miss_demote: int = 4                 # misses -> CONFIRMED demoted to TENTATIVE
     miss_prune: int = 8                  # misses -> landmark removed entirely
     max_range_m: float = 8.0             # ignore ground projections past this
+    # (xmin, ymin, xmax, ymax) of the room — the tags' bounding rectangle —
+    # or None. Objects are only mapped inside it (plus the margin).
+    bounds: tuple | None = None
+    bounds_margin_m: float = 0.75
 
 
 @dataclass
@@ -119,6 +123,8 @@ class SemanticMap:
         if (np.hypot(ground[0] - origin[0], ground[1] - origin[1])
                 > self.cfg.max_range_m):
             return None
+        if not self._in_room(ground):
+            return None
 
         obs = Observation(cam_origin=origin, ray_dir=ray, ground_xy=ground,
                           robot_pose=tuple(robot_xytheta),
@@ -132,6 +138,14 @@ class SemanticMap:
         self._ingest(lm, obs, cls, now)
         self._updated_this_frame.add(lm.id)
         return lm
+
+    def _in_room(self, xy) -> bool:
+        b = self.cfg.bounds
+        if b is None:
+            return True
+        m = self.cfg.bounds_margin_m
+        return (b[0] - m <= xy[0] <= b[2] + m
+                and b[1] - m <= xy[1] <= b[3] + m)
 
     def _associate(self, ground_xy: np.ndarray):
         """Nearest existing landmark within the gating radius, or None.
@@ -282,5 +296,6 @@ class SemanticMap:
                     t=o['t'],
                 ) for o in ld.get('observations', [])],
             )
-            m.landmarks[lm.id] = lm
+            if m._in_room(lm.position):     # drop mislocated leftovers
+                m.landmarks[lm.id] = lm
         return m

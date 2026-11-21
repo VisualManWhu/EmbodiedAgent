@@ -178,8 +178,19 @@ class PoseEstimator:
     """Stateful wrapper: adds the camera-mount transform so it can also report
     the robot *base* pose, given the current pan/tilt angles."""
 
+    # A fix that puts the robot this far outside the rectangle spanned by
+    # the tags is wrong: the tags hang on the walls, the robot is in the
+    # room. (Field: fixes at y = -30 m planted "landmarks" out there.)
+    ROOM_MARGIN_M = 0.75
+
     def __init__(self, tag_map: dict, K, dist=None, mount: dict | None = None):
         self.tag_map = tag_map
+        self.rejected_outside = 0
+        xs = [float(e['x']) for e in tag_map.values()]
+        ys = [float(e['y']) for e in tag_map.values()]
+        # needs at least a triangle of tags to mean anything
+        self.room = ((min(xs), min(ys), max(xs), max(ys))
+                     if len(tag_map) >= 3 else None)
         self.K = np.asarray(K, dtype=np.float64)
         self.dist = (np.zeros(5) if dist is None
                      else np.asarray(dist, dtype=np.float64))
@@ -205,6 +216,13 @@ class PoseEstimator:
         T_base_cam = transforms.camera_pose_in_base(pan_rad, tilt_rad,
                                                     self.mount)
         T_map_base = T_map_cam @ transforms.invert(T_base_cam)
+        if self.room is not None:
+            bx, by = float(T_map_base[0, 3]), float(T_map_base[1, 3])
+            m = self.ROOM_MARGIN_M
+            if not (self.room[0] - m <= bx <= self.room[2] + m
+                    and self.room[1] - m <= by <= self.room[3] + m):
+                self.rejected_outside += 1
+                return None
         return {
             'T_map_cam': T_map_cam,
             'T_map_base': T_map_base,
