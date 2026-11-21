@@ -145,6 +145,8 @@ class SlamRunner:
         nav_field_map = {
             'arrived_radius_m': 'arrived_radius_m',
             'v_max': 'nav_v_max',
+            'v_eff': 'nav_v_eff',
+            'max_step_m': 'nav_max_step_m',
             'w_max': 'nav_w_max',
             'w_eff': 'nav_w_eff',
             'max_pulse_sec': 'max_pulse_sec',
@@ -156,7 +158,8 @@ class SlamRunner:
             if val is not None:
                 setattr(self.nav_config, cfg_field, val)
         print(f'nav: arrived={self.nav_config.arrived_radius_m}m  '
-              f'v={self.nav_config.v_max}m/s  '
+              f'v_cmd={self.nav_config.v_max}/v_eff={self.nav_config.v_eff}m/s  '
+              f'step<={self.nav_config.max_step_m}m  '
               f'w_cmd={self.nav_config.w_max}/w_eff={self.nav_config.w_eff}rad/s  '
               f'pulse<={self.nav_config.max_pulse_sec}s  '
               f'dr<={dr_time}s/{dr_dist}m  '
@@ -173,6 +176,15 @@ class SlamRunner:
         self.grid_path = os.path.join(os.path.dirname(map_json_path),
                                       'traverse_grid.json')
         self._prev_fix = None               # (x, y, t) of the last tag fix
+        # Motion calibration sampling: what each pulse REALLY did, measured
+        # between a tag fix just before it and one just after.
+        self.calib_path = os.path.join(os.path.dirname(map_json_path),
+                                       'motion_calib.csv')
+        self._last_fix = None               # (t, pose, tag id, yaw_reliable)
+        # Stuck detection: was the last forward pulse followed by motion?
+        self._stuck = None                  # StuckCheck for the pulse in flight
+        self._cur_sig = None                # band-passed view of this frame
+        self._cal = None                    # the pulse being measured
         self._last_block = None             # (t, pose) of the last block
         if nav_overrides.get('grid', True):
             from slam.traverse_grid import TraverseGrid
@@ -230,9 +242,13 @@ class SlamRunner:
         """
         self._last_pan = pan_rad
         self._release_deferred_done(now)
+        if self.session_nav is not None:
+            from slam.stuck_detector import frame_signature
+            self._cur_sig = frame_signature(frame)
         tag_dets = self.tag_detector.detect(frame)
+        frame_ok = self._frame_pan_valid(pan_rad, tag_dets, now)
         pose = (self.pose_est.estimate(tag_dets, pan_rad, tilt_rad)
-                if self._frame_pan_valid(pan_rad, tag_dets, now) else None)
+                if frame_ok else None)
         located = pose is not None
         if located:
             T_map_cam = pose['T_map_cam']
@@ -245,6 +261,10 @@ class SlamRunner:
             self.renderer.update_path(rx, ry)
             self.last_robot = (rx, ry, ryaw)
             self._grid_note_fix(rx, ry, now)
+            fix = (now, (rx, ry, ryaw), pose.get('rotation_tag'),
+                   bool(pose.get('yaw_reliable', True)))
+            self._calib_on_fix(fix)
+            self._last_fix = fix
 
         if now - self._last_render >= self.RENDER_INTERVAL:
             self._render()
@@ -263,6 +283,15 @@ class SlamRunner:
             events = self.pi_events.take(self._get_pi_status())
         nav_status = None
         if self.session_nav is not None:
+            # Heading for a tag that is in view: localize against THAT tag
+            # alone. The goal is defined relative to it, so any error in the
+            # tag map cancels, where fixes on other tags disagreed by up to
+            # a metre and 90 degrees right next to tags 5 and 6.
+            goal_pose, goal_bearing = (
+                self._goal_tag_view(tag_dets, pan_rad, tilt_rad)
+                if frame_ok else (None, None))
+            if goal_pose is not None:
+                pose, located = goal_pose, True
             if located:
                 rx, ry, ryaw = pose['base_xytheta']
                 self.dead_reckoner.reset((rx, ry, ryaw), now)
@@ -278,6 +307,8 @@ class SlamRunner:
             self._nav_pose_dbg = (robot_pose, located, pose_stale)
             self._nav_yaw_ok = bool(located and pose.get('yaw_reliable', True))
             self._nav_fix_tag = pose.get('rotation_tag') if located else None
+            self._tick_stuck(now, pan_rad, frame_ok,
+                             (rx, ry, ryaw) if located else None)
             hold = self._tick_aimer(now, robot_pose, pose_stale)
             self._plan_route_if_needed(robot_pose, pose_stale)
             cmd = None
@@ -285,7 +316,8 @@ class SlamRunner:
                 cmd = self.session_nav.tick(robot_pose, now,
                                             pose_stale=pose_stale,
                                             target_ahead=target_ahead,
-                                            pose_fresh=located)
+                                            pose_fresh=located,
+                                            goal_bearing=goal_bearing)
             if cmd is not None and cmd.kind != 'stop':
                 self._send_nav(cmd, now)
                 if cmd.kind == 'scan_rotate' and self.aimer is not None:
@@ -312,6 +344,125 @@ class SlamRunner:
                 nav_status = (f'SEEK-{seek.state.value}'
                               + (f'/{nav_status}' if nav_status else ''))
         return len(tag_dets), located, nav_status
+
+    # ---- stuck detection -------------------------------------------------
+
+    STUCK_MIN_PULSE_SEC = 1.0       # shorter pulses move too little to judge
+
+    def _stuck_on_pulse(self, cmd, now):
+        """Start watching a forward pulse: note where the robot believes it
+        is and what the camera sees, to compare once the pulse has run."""
+        self._stuck = None
+        if cmd.kind != 'forward' or cmd.seconds < self.STUCK_MIN_PULSE_SEC:
+            return
+        from slam.stuck_detector import StuckCheck
+        pose = getattr(self, '_nav_pose_dbg', (None,))[0]
+        fix = self._last_fix
+        pre_fix = (fix[1] if fix is not None
+                   and now - fix[0] <= self.CAL_PRE_MAX_AGE else None)
+        self._stuck = StuckCheck(now, cmd.seconds * self.nav_config.v_eff,
+                                 pose, self._cur_sig, self._last_pan,
+                                 pre_fix=pre_fix)
+
+    def _stuck_on_event(self, event, now):
+        if self._stuck is None:
+            return
+        if event == 'pulse_done':
+            self._stuck.on_done(now)
+        elif event.startswith('blocked'):
+            self._stuck = None          # the sensor saw it: handled as a block
+
+    def _tick_stuck(self, now, pan_rad, frame_ok, fix):
+        chk, nav = self._stuck, self.session_nav
+        if chk is None or nav is None:
+            return
+        verdict = chk.evaluate(now, self._cur_sig, pan_rad, frame_ok, fix=fix)
+        if verdict is None:
+            return
+        self._stuck = None
+        ncc = 'n/a' if chk.ncc is None else f'{chk.ncc:.2f}'
+        moved = 'n/a' if chk.moved_m is None else f'{chk.moved_m:+.2f} m'
+        print(f'[{time.time():.3f}] MOTION: {verdict} (by {chk.how})  '
+              f'picture ncc={ncc}  fix displacement={moved}  '
+              f'expected {chk.expected_m:.2f} m')
+        if verdict != 'stuck':
+            return
+        # The robot is where it was when the pulse started, not where dead
+        # reckoning carried it.
+        self.dead_reckoner.cancel_pulse(chk.t0)
+        pose = fix or chk.pre_pose
+        if pose is not None and self.grid is not None:
+            marked = self.grid.mark_stuck(pose, confirmed=chk.how == 'fix')
+            self._last_block = (now, pose)
+            print(f'[{time.time():.3f}] GRID: stuck at ({pose[0]:+.2f},'
+                  f'{pose[1]:+.2f}) -> '
+                  + (' '.join(f'({x:+.2f},{y:+.2f})' for x, y in marked)
+                     + ' marked danger' if marked else
+                     'not marked yet (driven ground, first report)'))
+        nav.on_stuck()
+
+    # ---- motion calibration sampling ------------------------------------
+
+    CAL_PRE_MAX_AGE = 2.5       # fix must be this fresh when the pulse starts
+    CAL_POST_MAX_WAIT = 8.0     # ...and the next one this soon after it ends
+    CAL_SETTLE = 0.4            # let the robot stop before trusting a fix
+
+    def _calib_on_pulse(self, cmd, now):
+        """A pulse is being sent: remember it, with the fix it starts from
+        (if there is a fresh one). Dead reckoning assumes fixed speeds for
+        every pulse; this measures what each one actually did."""
+        pre = self._last_fix
+        if pre is None or now - pre[0] > self.CAL_PRE_MAX_AGE:
+            self._cal = None
+            return
+        self._cal = {'kind': cmd.kind, 'vx': cmd.vx, 'vy': cmd.vy,
+                     'wz': cmd.wz, 'sec': cmd.seconds, 't0': now,
+                     'pre': pre, 'done': None}
+
+    def _calib_on_event(self, event, now):
+        if self._cal is None:
+            return
+        if event == 'pulse_done' and self._cal['done'] is None:
+            self._cal['done'] = now
+        elif event.startswith('blocked'):
+            self._cal = None            # cut short: duration is unknown
+
+    def _calib_on_fix(self, fix):
+        """First fix after the measured pulse finished -> one sample."""
+        cal = self._cal
+        if cal is None or cal['done'] is None:
+            return
+        t, (x, y, yaw), tag, yaw_ok = fix
+        if t < cal['done'] + self.CAL_SETTLE:
+            return
+        self._cal = None
+        if t - cal['done'] > self.CAL_POST_MAX_WAIT:
+            return
+        _t0, (x0, y0, yaw0), tag0, yaw_ok0 = cal['pre']
+        dx, dy = x - x0, y - y0
+        # displacement in the robot's own frame at the start of the pulse
+        fwd = dx * math.cos(yaw0) + dy * math.sin(yaw0)
+        left = -dx * math.sin(yaw0) + dy * math.cos(yaw0)
+        dyaw = math.atan2(math.sin(yaw - yaw0), math.cos(yaw - yaw0))
+        row = {'t': round(cal['t0'], 3), 'kind': cal['kind'],
+               'vx': cal['vx'], 'vy': cal['vy'], 'wz': round(cal['wz'], 3),
+               'sec': round(cal['sec'], 3), 'dist': round(math.hypot(dx, dy), 3),
+               'fwd': round(fwd, 3), 'left': round(left, 3),
+               'dyaw': round(dyaw, 4), 'tag_pre': tag0, 'tag_post': tag,
+               'same_tag': int(tag0 == tag),
+               'yaw_ok': int(yaw_ok0 and yaw_ok)}
+        print(f'[{time.time():.3f}] CAL: {row["kind"]:11s} {row["sec"]:.2f}s  '
+              f'moved {row["dist"]:.2f} m (fwd {fwd:+.2f}, left {left:+.2f}), '
+              f'turned {math.degrees(dyaw):+.0f}°  tag {tag0}->{tag}'
+              f'{"" if row["same_tag"] else "  (different tags)"}')
+        try:
+            new = not os.path.exists(self.calib_path)
+            with open(self.calib_path, 'a', encoding='utf-8') as f:
+                if new:
+                    f.write(','.join(row) + '\n')
+                f.write(','.join(str(v) for v in row.values()) + '\n')
+        except OSError as e:
+            print(f'warning: could not write motion calibration: {e}')
 
     # ---- traversability grid --------------------------------------------
 
@@ -342,7 +493,8 @@ class SlamRunner:
         # aim for any reachable node inside the arrival radius
         route = self.grid.plan(
             robot_pose[:2], nav.goal_xy,
-            goal_radius_m=0.8 * self.nav_config.arrived_radius_m)
+            goal_radius_m=0.8 * (nav.arrive_radius_m
+                                 or self.nav_config.arrived_radius_m))
         if route is None:
             from slam.nav_session import State
             print(f'[{time.time():.3f}] PLAN-> no route to '
@@ -425,6 +577,22 @@ class SlamRunner:
                     now)
         return True
 
+    def _goal_tag_view(self, tag_dets, pan_rad, tilt_rad):
+        """``(pose, bearing)`` from the tag the active goto is heading for,
+        if it is in this frame; ``(None, None)`` otherwise. ``pose`` is the
+        usual pose dict solved from that one tag; ``bearing`` is the tag's
+        direction from the robot's heading (rad, + = left), read straight
+        off its position in the picture plus the camera pan."""
+        nav = self.session_nav
+        if nav is None or nav.goal_tag_id is None:
+            return None, None
+        det = next((d for d in tag_dets if d['id'] == nav.goal_tag_id), None)
+        if det is None:
+            return None, None
+        bearing = pan_rad + math.atan2(self.K[0][2] - det['center'][0],
+                                       self.K[0][0])
+        return self.pose_est.estimate([det], pan_rad, tilt_rad), bearing
+
     def _tick_aimer(self, now, robot_pose, pose_stale):
         """Point the camera for the active goto. Returns True when the chassis
         must hold still this tick."""
@@ -432,10 +600,13 @@ class SlamRunner:
         if a is None or nav is None:
             return False
         from slam.nav_session import State
+        if self._stuck is not None and self._stuck.wants_camera_still(now):
+            return True         # the 'after' picture has not been taken yet
         still = nav.state is not State.WAITING_PULSE
         pose_ok = (robot_pose is not None and not pose_stale
                    and nav.last_tag_t is not None)
-        pan = a.update(now, robot_pose if pose_ok else None, still)
+        pan = a.update(now, robot_pose if pose_ok else None, still,
+                       prefer=nav.goal_tag_id)
         if pan is not None:
             print(f'[{time.time():.3f}] AIM-> pan={math.degrees(pan):+5.0f}°  '
                   + (f'tag{a.target_id}' if a.target_id is not None
@@ -652,18 +823,30 @@ class SlamRunner:
         elif 'tag_id' in req:
             # stop in front of the tag, looking at it — not at the wall it
             # hangs on, where the camera cannot even see it
+            from slam.landmark_selector import tag_bounds
             spot = tag_standoff(self.tag_map, req['tag_id'],
                                 self.tag_standoff_m,
-                                cam_height_m=self.cam_height_m)
+                                cam_height_m=self.cam_height_m,
+                                bounds=tag_bounds(self.tag_map),
+                                avoid=self._standoff_in_danger)
             if spot is None:
                 h.send_response(404); h.end_headers(); return
             self.start_goto(spot[0], None, f"tag{req['tag_id']}",
-                            final_yaw=spot[1])
+                            final_yaw=spot[1],
+                            goal_tag_id=int(req['tag_id']))
         elif 'xy' in req:
             self.start_goto(tuple(req['xy']), None, req.get('label', 'point'))
         else:
             h.send_response(400); h.end_headers(); return
         h.send_response(200); h.end_headers()
+
+    def _standoff_in_danger(self, xy):
+        """True if the traversability grid already knows this spot as
+        danger — no point choosing a viewpoint the planner cannot reach."""
+        if self.grid is None:
+            return False
+        from slam.traverse_grid import DANGER
+        return self.grid.state_at(xy) == DANGER
 
     def _handle_seek(self, h):
         import json as _json
@@ -698,7 +881,10 @@ class SlamRunner:
 
     # ---- navigation lifecycle ------------------------------------------
 
-    def start_goto(self, goal_xy, goal_id, goal_label, final_yaw=None):
+    TAG_ARRIVE_RADIUS_M = 0.3           # tighter than an object goal's
+
+    def start_goto(self, goal_xy, goal_id, goal_label, final_yaw=None,
+                   goal_tag_id=None):
         from slam.nav_session import NavSession
         # NavSession imported lazily so SlamRunner can be constructed without
         # the slam package; only used when --slam, which already imported it.
@@ -708,7 +894,12 @@ class SlamRunner:
         self.session_nav = NavSession(goal_xy=goal_xy, goal_id=goal_id,
                                       goal_label=goal_label,
                                       config=self.nav_config,
-                                      final_yaw=final_yaw)
+                                      final_yaw=final_yaw,
+                                      goal_tag_id=goal_tag_id,
+                                      arrive_radius_m=(
+                                          self.TAG_ARRIVE_RADIUS_M
+                                          if goal_tag_id is not None
+                                          else None))
         print(f'[{time.time():.3f}] NAV start -> {goal_label} '
               f'id={goal_id} at {goal_xy}'
               + ('' if final_yaw is None else f' facing {final_yaw:+.2f}rad'))
@@ -737,6 +928,8 @@ class SlamRunner:
                    'vx': cmd.vx, 'vy': cmd.vy, 'wz': cmd.wz,
                    'seconds': cmd.seconds}
         self._last_nav_kind = cmd.kind
+        self._calib_on_pulse(cmd, now)
+        self._stuck_on_pulse(cmd, now)
         # timestamp is Unix epoch — same clock as the Pi ROS log stamps,
         # so the two logs can be aligned line-for-line.
         print(f'[{time.time():.3f}] NAV-> {cmd.kind:11s} '
@@ -765,7 +958,13 @@ class SlamRunner:
         yaw_rate = modeled_yaw_rate(cmd.vx, cmd.vy, cmd.wz,
                                     self.nav_config.w_max,
                                     self.nav_config.w_eff)
-        self.dead_reckoner.record_pulse(cmd.vx, cmd.vy, yaw_rate,
+        # Likewise the forward speed: v_eff, not the commanded v_max. Only
+        # forward motion is rescaled — that is the only one measured so far
+        # (one backward sample read 0.17 m/s, strafing none at all).
+        vx = cmd.vx
+        if vx > 0 and self.nav_config.v_max:
+            vx = vx * self.nav_config.v_eff / self.nav_config.v_max
+        self.dead_reckoner.record_pulse(vx, cmd.vy, yaw_rate,
                                         cmd.seconds, now)
 
     def _nav_pose_text(self):
@@ -789,6 +988,11 @@ class SlamRunner:
             before = self.session_nav.state.value
             self.session_nav.on_pi_event(event)
             self._grid_on_block(event, now)
+            self._calib_on_event(event, now)
+            self._stuck_on_event(event, now)
+            if event.startswith('blocked'):
+                # the Pi cut the pulse short: so must dead reckoning
+                self.dead_reckoner.truncate_pulses(now)
             if (event == 'pulse_done' and self.grid is not None
                     and getattr(self, '_last_nav_kind', None) == 'forward'):
                 pose, _located, stale = getattr(
@@ -955,6 +1159,11 @@ def main():
     # navigation
     ap.add_argument('--arrived-radius-m', type=float, default=0.4)
     ap.add_argument('--nav-v-max', type=float, default=0.15)
+    ap.add_argument('--nav-v-eff', type=float, default=0.25,
+                    help='forward speed (m/s) the robot really drives at '
+                         'when commanded --nav-v-max; see motion_calib.csv')
+    ap.add_argument('--nav-max-step-m', type=float, default=0.45,
+                    help='longest stretch driven in one forward pulse')
     ap.add_argument('--nav-w-max', type=float, default=0.5,
                     help='commanded yaw rate for rotate/scan pulses')
     ap.add_argument('--nav-w-eff', type=float, default=1.5,
@@ -1013,6 +1222,8 @@ def main():
             'nav_v_max': args.nav_v_max,
             'nav_w_max': args.nav_w_max,
             'nav_w_eff': args.nav_w_eff,
+            'nav_v_eff': args.nav_v_eff,
+            'nav_max_step_m': args.nav_max_step_m,
             'max_pulse_sec': args.max_pulse_sec,
             'no_tag_grace_sec': args.no_tag_grace_sec,
             'dr_distance_limit_m': args.dr_distance_limit_m,

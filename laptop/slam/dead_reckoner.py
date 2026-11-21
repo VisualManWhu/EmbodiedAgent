@@ -58,6 +58,27 @@ class DeadReckoner:
         self.pulses.append(_Pulse(float(vx), float(vy), float(wz),
                                   float(seconds), float(started_at)))
 
+    def truncate_pulses(self, now: float):
+        """The robot was stopped early (the front sensor tripped): pulses
+        still running end NOW, not at their planned duration. Without this
+        the pose was carried on to the end of the pulse — once to within
+        7 cm of a goal the robot was still half a metre from."""
+        kept = []
+        for p in self.pulses:
+            if p.started_at >= now:
+                continue                            # never started
+            end = p.started_at + p.seconds
+            if end > now:
+                p = _Pulse(p.vx, p.vy, p.wz, now - p.started_at, p.started_at)
+            kept.append(p)
+        self.pulses = kept
+
+    def cancel_pulse(self, started_at: float):
+        """Forget a recorded pulse that turned out not to have moved the
+        robot (it was stuck), so the pose is not carried on without it."""
+        self.pulses = [p for p in self.pulses
+                       if abs(p.started_at - started_at) > 1e-6]
+
     def pose_at(self, now: float):
         """``(pose, stale)`` — pose extrapolated to ``now`` if within caps."""
         if self.last_pose is None or self.last_t is None:

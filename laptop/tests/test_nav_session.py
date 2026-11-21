@@ -503,3 +503,102 @@ def test_block_near_an_object_goal_is_still_an_arrival():
     s.tick((1.4, 0.0, 0.0), 0.0)
     s.on_pi_event('blocked:front')
     assert s.state is State.ARRIVED
+
+
+# ---- tag goals: face the tag by where it is in the picture ----------------
+
+def _tag_sess(**cfg):
+    s = NavSession(goal_xy=(2.0, 0.0), goal_id=None, goal_label='tag5',
+                   config=NavConfig(**cfg), final_yaw=0.0, goal_tag_id=5,
+                   arrive_radius_m=0.3)
+    s.on_tag_fix(0.0)
+    return s
+
+
+def test_faces_the_goal_tag_by_its_bearing_not_by_the_solved_heading():
+    """Field bug: near tags 5 and 6 successive fixes disagreed about the
+    robot's heading by 90 degrees and more, so it kept 'correcting' and never
+    settled. Where the tag sits in the picture is not open to that."""
+    s = _tag_sess()
+    # solved heading says "perfectly aligned", the picture says the tag is
+    # 30 degrees to the left: believe the picture
+    cmd = s.tick((2.0, 0.0, 0.0), 0.0, goal_bearing=math.radians(30))
+    assert cmd.kind == 'rotate' and cmd.wz > 0
+    assert cmd.seconds == pytest.approx(math.radians(30) / s.config.w_eff)
+
+
+def test_goal_tag_centred_in_view_is_arrival_whatever_the_pose_says():
+    s = _tag_sess()
+    cmd = s.tick((2.0, 0.0, 2.5), 0.0, goal_bearing=math.radians(4))
+    assert s.state is State.ARRIVED and cmd.kind == 'stop'
+
+
+def test_goal_tag_out_of_view_falls_back_to_the_solved_heading():
+    s = _tag_sess()
+    cmd = s.tick((2.0, 0.0, 1.2), 0.0, goal_bearing=None)
+    assert cmd.kind == 'rotate' and cmd.wz < 0          # turn back toward 0
+
+
+def test_bearing_facing_stops_after_a_few_tries():
+    s = _tag_sess(nav_dwell_sec=0.0, final_face_max=3)
+    t = 0.0
+    for _ in range(3):
+        cmd = s.tick((2.0, 0.0, 0.0), t, goal_bearing=0.5)
+        assert cmd.kind == 'rotate'
+        s.on_pi_event('pulse_done')
+        t += 10.0
+    cmd = s.tick((2.0, 0.0, 0.0), t, goal_bearing=0.5)
+    assert s.state is State.ARRIVED
+
+
+def test_tag_goal_uses_its_own_tighter_arrival_radius():
+    """0.4 m of slack around a 1 m standoff let the robot stop 0.6 m from the
+    tag — inside the range where the tag is above the camera's view."""
+    s = _tag_sess(arrived_radius_m=0.4)
+    cmd = s.tick((1.65, 0.0, 0.0), 0.0, goal_bearing=0.0)   # 0.35 m short
+    assert s.state is not State.ARRIVED
+    assert cmd.kind == 'forward'
+    s2 = _tag_sess(arrived_radius_m=0.4)
+    s2.tick((1.75, 0.0, 0.0), 0.0, goal_bearing=0.0)        # 0.25 m short
+    assert s2.state is State.ARRIVED
+
+
+# ---- real forward speed ---------------------------------------------------
+
+def test_forward_pulse_is_timed_for_the_real_speed_not_the_commanded_one():
+    """Field: commanded 0.15 m/s, measured 0.25. Timing pulses for 0.15 drove
+    the robot ~1.7x further than intended."""
+    s = _sess(goal=(0.30, 0.0), v_max=0.15, v_eff=0.25, arrived_radius_m=0.1,
+              max_step_m=0.45)
+    cmd = s.tick((0.0, 0.0, 0.0), 0.0)
+    assert cmd.kind == 'forward'
+    assert cmd.vx == 0.15                           # the command is unchanged
+    assert cmd.seconds == pytest.approx(0.30 / 0.25)
+
+
+def test_one_forward_pulse_never_outruns_dead_reckoning():
+    s = _sess(goal=(5.0, 0.0), v_eff=0.25, max_step_m=0.45, max_pulse_sec=2.5)
+    cmd = s.tick((0.0, 0.0, 0.0), 0.0)
+    assert cmd.seconds == pytest.approx(0.45 / 0.25)        # 1.8 s, not 2.5
+    assert cmd.seconds * 0.25 <= 0.5
+
+
+def test_stuck_backs_off_and_asks_for_a_new_route():
+    s = _sess(goal=(5.0, 0.0), replan_on_block=True)
+    s.tick((0.0, 0.0, 0.0), 0.0)
+    s.on_pi_event('pulse_done')
+    s.on_stuck()
+    assert [c.kind for c in s.queued] == ['backward']
+    assert s.needs_replan is True and s.blocks_total == 1
+    cmd = s.tick((0.0, 0.0, 0.0), 1.0)                  # no dwell in the way
+    assert cmd.kind == 'backward'
+
+
+def test_being_stuck_again_and_again_fails_the_goto():
+    s = _sess(goal=(5.0, 0.0), max_blocks=2)
+    s.tick((0.0, 0.0, 0.0), 0.0)
+    s.on_stuck()
+    s.on_stuck()
+    assert s.state is not State.FAILED
+    s.on_stuck()
+    assert s.state is State.FAILED and s.fail_reason == 'blocked'

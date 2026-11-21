@@ -27,7 +27,18 @@ class NavConfig:
     # this and open-loop mecanum rotation (no encoder) plus noisy single-tag
     # yaw can never land inside the tolerance -> the robot spins forever.
     heading_tol_rad: float = 0.5
-    v_max: float = 0.15
+    v_max: float = 0.15                      # commanded forward speed
+    # speed the robot ACTUALLY drives at when commanded v_max. Like w_eff:
+    # open loop, and the command already sits on the motor duty floor, so
+    # the commanded number is not the real one. Measured from pulses
+    # bracketed by fixes on the same tag: 0.21-0.26 m/s over seven samples,
+    # median 0.25. Assuming 0.15 under-counted every 2.5 s pulse by ~25 cm:
+    # the robot overran its goals and the grid was marked a node behind.
+    v_eff: float = 0.25
+    # Longest stretch to drive in one pulse. Dead reckoning is only trusted
+    # for 0.5 m, so a pulse must end inside that or the pose goes stale and
+    # every step costs a re-localization.
+    max_step_m: float = 0.45
     w_max: float = 0.5                       # commanded yaw rate (rotate/scan)
     # effective yaw rate the robot ACTUALLY turns at when commanded w_max —
     # open-loop, no encoder, so the commanded number is not the real rate.
@@ -82,6 +93,9 @@ class NavConfig:
     # turn that in reality overshot by 30 deg. Wait this long for a fix
     # before settling for the dead-reckoned heading.
     final_fix_wait_sec: float = 12.0
+    # A tag goal is faced by where the tag sits in the picture, not by the
+    # solved heading: "centred" means within this of straight ahead.
+    face_bearing_tol_rad: float = 0.2
     # Route following (traversability grid). An intermediate waypoint counts
     # as reached within this radius; only the goal needs arrived_radius_m.
     waypoint_radius_m: float = 0.3
@@ -125,6 +139,10 @@ class NavSession:
     _facing: bool = False                    # position reached, now turning
     _face_count: int = 0
     _final_wait_t: float | None = None       # waiting for a fix to confirm
+    # the AprilTag this goto is going to look at, if it is a tag goal
+    goal_tag_id: int | None = None
+    # arrival radius for this goto; None = config.arrived_radius_m
+    arrive_radius_m: float | None = None
     # route: intermediate points to pass through on the way to goal_xy
     waypoints: list = field(default_factory=list)
     route_ready: bool = False                # a route has been planned
@@ -138,6 +156,24 @@ class NavSession:
         self.waypoints = [(float(x), float(y)) for x, y in waypoints]
         self.route_ready = True
         self.needs_replan = False
+
+    def on_stuck(self):
+        """A forward pulse ran its course and the robot did not move — held
+        by something the front sensor cannot see. Treated like a block: back
+        off, and have the caller plan a way round."""
+        self.blocks_total += 1
+        if self.blocks_total > self.config.max_blocks:
+            self.state = State.FAILED
+            self.fail_reason = 'blocked'
+            return
+        self.queued.clear()
+        self.queued.append(NavCommand(-self.config.v_max, 0.0, 0.0,
+                                      self.config.blocked_backup_sec,
+                                      'backward'))
+        self.needs_replan = True
+        self._drive_resume_t = None
+        if self.state is not State.WAITING_PULSE:
+            self.state = State.DRIVING
 
     def on_tag_fix(self, t: float):
         """Record that a tag-fix arrived at time ``t``.
@@ -241,8 +277,13 @@ class NavSession:
         self.state = State.DRIVING
 
     def tick(self, robot_pose, now: float, pose_stale: bool = False,
-             target_ahead: bool = False, pose_fresh: bool = True):
+             target_ahead: bool = False, pose_fresh: bool = True,
+             goal_bearing: float | None = None):
         """Produce the next motion pulse, or None if nothing to send.
+
+        ``goal_bearing`` — for a tag goal, the direction of that tag from
+        the robot's heading as seen in THIS frame (rad, + = to the left), or
+        None when it is not in view.
 
         ``pose_fresh`` — ``robot_pose`` is a tag fix from this very frame
         rather than a dead-reckoned extrapolation.
@@ -282,12 +323,13 @@ class NavSession:
             self._scan_resume_t = None
 
         x, y, yaw = robot_pose
+        radius = self.arrive_radius_m or self.config.arrived_radius_m
         goal_dist = math.hypot(self.goal_xy[0] - x, self.goal_xy[1] - y)
         self._last_goal_dist = goal_dist
         # tick off waypoints already reached; within reach of the goal the
         # rest of the route no longer matters
         while self.waypoints and (
-                goal_dist < self.config.arrived_radius_m
+                goal_dist < radius
                 or math.hypot(self.waypoints[0][0] - x,
                               self.waypoints[0][1] - y)
                 < self.config.waypoint_radius_m):
@@ -295,14 +337,24 @@ class NavSession:
         target = self.waypoints[0] if self.waypoints else self.goal_xy
         dx, dy = target[0] - x, target[1] - y
         dist = math.hypot(dx, dy)
-        if self._facing or goal_dist < self.config.arrived_radius_m:
+        if self._facing or goal_dist < radius:
             settling = (self._drive_resume_t is not None
                         and now < self._drive_resume_t)
             if self._facing and settling:
                 return None             # let the last facing turn settle
-            if self.final_yaw is not None:
-                err = _wrap(self.final_yaw - yaw)
-                turn = (abs(err) > self.config.final_heading_tol_rad
+            if self.final_yaw is not None or goal_bearing is not None:
+                if goal_bearing is not None:
+                    # The goal tag is in view: turn until it is centred. This
+                    # needs no pose at all, so it cannot be thrown by fixes
+                    # that disagree about the heading — and it is exactly
+                    # what "arrived, looking at the tag" means.
+                    err = goal_bearing
+                    tol = self.config.face_bearing_tol_rad
+                    pose_fresh = True
+                else:
+                    err = _wrap(self.final_yaw - yaw)
+                    tol = self.config.final_heading_tol_rad
+                turn = (abs(err) > tol
                         and self._face_count < self.config.final_face_max)
                 if not turn and not pose_fresh:
                     # About to call the heading good on dead reckoning alone
@@ -360,7 +412,7 @@ class NavSession:
         # roughly aimed -> drive forward, blending in proportional steering so
         # the heading self-corrects along the way (curve onto the goal line,
         # no drift-then-snap zigzag).
-        sec = _clamp(dist / self.config.v_max,
+        sec = _clamp(min(dist, self.config.max_step_m) / self.config.v_eff,
                      self.config.min_pulse_sec, self.config.max_pulse_sec)
         wz = _clamp(self.config.steer_gain * heading_err,
                     -self.config.forward_steer_max,

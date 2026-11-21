@@ -1,4 +1,6 @@
 """SlamRunner <-> SeekSession glue, with the Pi and the map stubbed out."""
+import os
+import tempfile
 import threading
 import types
 
@@ -34,6 +36,13 @@ def _runner(landmarks=()):
     r.grid = None
     r._prev_fix = None
     r._last_block = None
+    r._last_fix = None
+    r._cal = None
+    from slam.dead_reckoner import DeadReckoner
+    r.dead_reckoner = DeadReckoner()
+    r._stuck = None
+    r._cur_sig = None
+    r.calib_path = os.path.join(tempfile.mkdtemp(), 'motion_calib.csv')
     r.tag_map = {}
     r._nav_done_lock = threading.Lock()
     r._nav_done_event = None
@@ -427,3 +436,246 @@ def test_block_with_an_untrusted_pose_marks_nothing():
     r._feed_nav_events(['blocked:front'], 110.0)
     assert DANGER not in {n['state'] for n in r.grid.snapshot()}
     assert r.session_nav.needs_replan is True            # still re-plans
+
+
+# ---- tag goals: localize against the goal tag itself -----------------------
+
+def _tag_goal_runner():
+    r = _runner()
+    r.K = [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]]
+    r.seen_by_estimator = []
+
+    def estimate(dets, pan, tilt):
+        r.seen_by_estimator.append([d['id'] for d in dets])
+        return {'base_xytheta': (1.0, 2.0, 0.3), 'yaw_reliable': False,
+                'rotation_tag': dets[0]['id']}
+    r.pose_est = types.SimpleNamespace(estimate=estimate)
+    r.start_goto((1.0, 1.0), None, 'tag6', final_yaw=0.0, goal_tag_id=6)
+    return r
+
+
+def test_tag_goto_is_set_up_with_its_tag_and_a_tighter_radius():
+    r = _tag_goal_runner()
+    assert r.session_nav.goal_tag_id == 6
+    assert r.session_nav.arrive_radius_m == 0.3
+    r.start_goto((1.0, 1.0), 5, 'chair')            # an object goal
+    assert r.session_nav.goal_tag_id is None
+    assert r.session_nav.arrive_radius_m is None
+
+
+def test_goal_tag_in_view_is_solved_on_its_own_and_gives_a_bearing():
+    import math as _m
+    r = _tag_goal_runner()
+    dets = [{'id': 1, 'center': (500.0, 200.0)},
+            {'id': 6, 'center': (320.0, 200.0)}]         # dead centre
+    pose, bearing = r._goal_tag_view(dets, 0.0, 0.0)
+    assert r.seen_by_estimator == [[6]]             # tag 1 was NOT mixed in
+    assert pose['base_xytheta'] == (1.0, 2.0, 0.3)
+    assert bearing == pytest.approx(0.0)
+    # left of centre in the picture = to the robot's left = positive
+    _, left = r._goal_tag_view([{'id': 6, 'center': (120.0, 200.0)}], 0.0, 0.0)
+    assert left == pytest.approx(_m.atan2(200.0, 600.0))
+    # the camera pan adds on
+    _, panned = r._goal_tag_view([{'id': 6, 'center': (320.0, 200.0)}],
+                                 0.4, 0.0)
+    assert panned == pytest.approx(0.4)
+
+
+def test_goal_tag_not_in_view_or_not_a_tag_goto_gives_nothing():
+    r = _tag_goal_runner()
+    assert r._goal_tag_view([{'id': 1, 'center': (320.0, 200.0)}],
+                            0.0, 0.0) == (None, None)
+    r.start_goto((1.0, 1.0), 5, 'chair')
+    assert r._goal_tag_view([{'id': 6, 'center': (320.0, 200.0)}],
+                            0.0, 0.0) == (None, None)
+
+
+# ---- motion calibration sampling -------------------------------------------
+
+def _pulse(kind, vx=0.0, wz=0.0, sec=2.5):
+    return types.SimpleNamespace(kind=kind, vx=vx, vy=0.0, wz=wz, seconds=sec)
+
+
+def _cal_rows(r):
+    import csv
+    if not os.path.exists(r.calib_path):
+        return []
+    with open(r.calib_path, encoding='utf-8') as f:
+        return list(csv.DictReader(f))
+
+
+def test_pulse_between_two_fixes_yields_a_calibration_sample():
+    """Dead reckoning assumed 0.15 m/s; two pulses in the field logs measured
+    0.25. This records every usable pulse so the figure rests on more than
+    two samples."""
+    r = _runner()
+    r._last_fix = (100.0, (1.0, 1.0, 0.0), 2, True)     # facing +x
+    r._calib_on_pulse(_pulse('forward', vx=0.15), 100.5)
+    r._calib_on_event('pulse_done', 103.2)
+    r._calib_on_fix((103.3, (1.2, 1.0, 0.0), 2, True))  # too soon: still rolling
+    assert _cal_rows(r) == []
+    r._calib_on_fix((104.0, (1.63, 1.05, 0.2), 2, True))
+    rows = _cal_rows(r)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row['kind'] == 'forward' and float(row['sec']) == 2.5
+    assert float(row['fwd']) == pytest.approx(0.63)
+    assert float(row['left']) == pytest.approx(0.05)
+    assert float(row['dyaw']) == pytest.approx(0.2)
+    assert row['same_tag'] == '1' and row['yaw_ok'] == '1'
+    r._calib_on_fix((105.0, (9.0, 9.0, 0.0), 2, True))  # not counted twice
+    assert len(_cal_rows(r)) == 1
+
+
+def test_displacement_is_resolved_in_the_robots_own_frame():
+    import math as _m
+    r = _runner()
+    r._last_fix = (100.0, (1.0, 1.0, _m.pi / 2), 3, True)   # facing +y
+    r._calib_on_pulse(_pulse('forward', vx=0.15), 100.2)
+    r._calib_on_event('pulse_done', 102.8)
+    r._calib_on_fix((104.0, (1.0, 1.6, _m.pi / 2), 4, False))
+    row = _cal_rows(r)[0]
+    assert float(row['fwd']) == pytest.approx(0.6)
+    assert float(row['left']) == pytest.approx(0.0, abs=1e-6)
+    assert row['same_tag'] == '0' and row['yaw_ok'] == '0'   # flagged, kept
+
+
+def test_pulses_that_cannot_be_measured_are_skipped():
+    r = _runner()
+    # no fresh fix when the pulse starts
+    r._last_fix = (90.0, (1.0, 1.0, 0.0), 2, True)
+    r._calib_on_pulse(_pulse('forward', vx=0.15), 100.0)
+    r._calib_on_event('pulse_done', 102.6)
+    r._calib_on_fix((103.5, (1.6, 1.0, 0.0), 2, True))
+    # cut short by an obstacle
+    r._last_fix = (110.0, (1.0, 1.0, 0.0), 2, True)
+    r._calib_on_pulse(_pulse('forward', vx=0.15), 110.5)
+    r._calib_on_event('blocked:front', 111.0)
+    r._calib_on_fix((113.0, (1.1, 1.0, 0.0), 2, True))
+    # no fix until long after it ended
+    r._last_fix = (120.0, (1.0, 1.0, 0.0), 2, True)
+    r._calib_on_pulse(_pulse('forward', vx=0.15), 120.5)
+    r._calib_on_event('pulse_done', 123.1)
+    r._calib_on_fix((140.0, (1.6, 1.0, 0.0), 2, True))
+    assert _cal_rows(r) == []
+
+
+def test_dead_reckoner_is_fed_the_real_forward_speed():
+    """The reckoner integrated 0.15 m/s; the robot does 0.25."""
+    r = _runner()
+    r.http = types.SimpleNamespace(post=lambda *a, **k: None)
+    r.cmd_url = ''
+    r.start_goto((3.0, 0.0), None, 'spot')
+    recorded = []
+    r.dead_reckoner = types.SimpleNamespace(
+        record_pulse=lambda vx, vy, wz, sec, t: recorded.append((vx, vy, wz)))
+    fwd = types.SimpleNamespace(kind='forward', vx=0.15, vy=0.0, wz=0.0,
+                                seconds=1.8)
+    back = types.SimpleNamespace(kind='backward', vx=-0.15, vy=0.0, wz=0.0,
+                                 seconds=1.0)
+    r._send_nav(fwd, 100.0)
+    r._send_nav(back, 103.0)
+    assert recorded[0][0] == pytest.approx(0.25)
+    assert recorded[1][0] == pytest.approx(-0.15)   # unmeasured: left alone
+
+
+# ---- stuck detection --------------------------------------------------------
+
+def _stuck_runner():
+    import numpy as np
+    from slam.stuck_detector import frame_signature
+    r = _grid_runner(goal=(3.5, 1.5))
+    r.http = types.SimpleNamespace(post=lambda *a, **k: None)
+    r.cmd_url = ''
+    r._plan_route_if_needed((1.0, 1.5, 0.0), False)
+    cancelled = []
+    r.dead_reckoner = types.SimpleNamespace(
+        record_pulse=lambda *a: None, cancel_pulse=cancelled.append,
+        truncate_pulses=lambda now: None)
+    r.cancelled = cancelled
+    rng = np.random.default_rng(0)
+    scene = np.repeat(np.repeat(
+        rng.integers(60, 180, (120, 160), dtype=np.uint8), 4, 0), 4, 1)
+    r.scene = scene
+    r.same_view = frame_signature(scene)
+    r.other_view = frame_signature(np.roll(scene, 20, axis=1))
+    r._cur_sig = r.same_view
+    r._nav_pose_dbg = ((1.0, 1.5, 0.0), False, False)
+    return r
+
+
+def _fwd(sec=1.8):
+    return types.SimpleNamespace(kind='forward', vx=0.15, vy=0.0, wz=0.0,
+                                 seconds=sec)
+
+
+def test_pulse_that_leaves_the_picture_unchanged_is_handled_as_stuck():
+    from slam.traverse_grid import DANGER
+    r = _stuck_runner()
+    r._send_nav(_fwd(), 100.0)
+    assert r._stuck is not None
+    r._feed_nav_events(['pulse_done'], 101.9)
+    r._cur_sig = r.same_view                         # nothing has changed
+    r._tick_stuck(102.4, 0.0, True, None)
+    assert r._stuck is None
+    assert r.cancelled == [100.0]                    # dead reckoning undone
+    assert r.grid.state_at((1.25, 1.5)) == DANGER    # the node ahead
+    assert [c.kind for c in r.session_nav.queued] == ['backward']
+    assert r.session_nav.needs_replan is True
+
+
+def test_pulse_after_which_the_picture_changed_is_left_alone():
+    from slam.traverse_grid import DANGER
+    r = _stuck_runner()
+    r._send_nav(_fwd(), 100.0)
+    r._feed_nav_events(['pulse_done'], 101.9)
+    r._cur_sig = r.other_view
+    r._tick_stuck(102.4, 0.0, True, None)
+    assert r._stuck is None and r.cancelled == []
+    assert DANGER not in {n['state'] for n in r.grid.snapshot()}
+    assert r.session_nav.needs_replan is False
+
+
+def test_stuck_confirmed_by_fixes_marks_where_the_robot_stands():
+    from slam.traverse_grid import DANGER
+    r = _stuck_runner()
+    r.grid.mark_path((1.0, 1.5), (1.0, 1.5))         # driven ground
+    r._last_fix = (99.5, (1.0, 1.5, 0.0), 3, True)
+    r._send_nav(_fwd(), 100.0)
+    r._feed_nav_events(['pulse_done'], 101.9)
+    r._tick_stuck(102.5, 0.0, True, (1.06, 1.5, 0.0))   # fix: barely moved
+    assert r.grid.state_at((1.0, 1.5)) == DANGER
+    assert r.grid.state_at((1.25, 1.5)) == DANGER
+
+
+def test_only_forward_pulses_that_can_be_judged_are_watched():
+    r = _stuck_runner()
+    r._send_nav(types.SimpleNamespace(kind='rotate', vx=0.0, vy=0.0, wz=0.5,
+                                      seconds=1.5), 100.0)
+    assert r._stuck is None
+    r._send_nav(_fwd(sec=0.4), 100.0)                # too short to tell
+    assert r._stuck is None
+    r._send_nav(_fwd(), 100.0)
+    r._feed_nav_events(['blocked:front'], 100.6)     # the sonar saw it
+    assert r._stuck is None
+
+
+def test_camera_is_not_panned_away_before_the_after_picture():
+    from slam.tag_aimer import TagAimer
+    r = _stuck_runner()
+    r.aimer = TagAimer(ROOM)
+    r._send_nav(_fwd(), 100.0)
+    r._feed_nav_events(['pulse_done'], 101.9)
+    assert r._tick_aimer(102.0, (1.0, 1.5, 0.0), False) is True
+    assert [c for c in r.sent if c.get('action') == 'pantilt'] == []
+
+
+def test_block_event_truncates_dead_reckoning():
+    r = _grid_runner()
+    cut = []
+    r.dead_reckoner = types.SimpleNamespace(truncate_pulses=cut.append)
+    r._nav_pose_dbg = ((1.0, 1.5, 0.0), False, False)
+    r._feed_nav_events(['pulse_done'], 109.0)
+    assert cut == []
+    r._feed_nav_events(['blocked:front'], 110.0)
+    assert cut == [110.0]

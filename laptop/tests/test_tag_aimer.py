@@ -169,3 +169,29 @@ def test_low_tag_is_still_usable_from_one_metre():
                 'yaw_deg': 0.0}}
     a = TagAimer(tags, AimConfig(cam_height_m=0.15))
     assert a.score(0, (0.8, 0.7, DEG(180)))[0] > 0.0     # ~1.06 m away
+
+
+def test_goal_tag_is_looked_at_even_though_it_is_face_on():
+    """Field bug: standing in front of the tag it had been sent to, the
+    camera looked away at distant side tags (face-on scores lowest), lost
+    them, and swept — while the goal tag was straight ahead."""
+    a = _aimer()
+    in_front_of_3 = (3.1, 1.1, DEG(-90))
+    a.update(0.0, in_front_of_3, robot_still=True)
+    assert a.target_id in (2, 4)                    # default: the side tags
+    b = _aimer()
+    pan = b.update(0.0, in_front_of_3, robot_still=True, prefer=3)
+    assert b.target_id == 3
+    assert pan is None and abs(b.pan_cmd) < DEG(6)  # already straight ahead
+
+
+def test_goal_tag_preference_gives_way_when_it_cannot_be_seen():
+    a = _aimer()
+    # tag 9 is behind the robot: look at something that can be seen instead
+    a.update(0.0, FACING_WALL, robot_still=True, prefer=9)
+    assert a.target_id in (2, 4)
+    # a goal tag that was aimed at and never seen is dropped like any other
+    b = _aimer(look_timeout_sec=2.0)
+    b.update(0.0, (3.1, 1.1, DEG(-90)), robot_still=True, prefer=3)
+    b.update(3.0, (3.1, 1.1, DEG(-90)), robot_still=True, prefer=3)
+    assert b.target_id != 3

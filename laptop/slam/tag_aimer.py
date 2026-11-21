@@ -127,9 +127,14 @@ class TagAimer:
         self._cmd_t = now
         return pan
 
-    def update(self, now: float, pose, robot_still: bool):
+    def update(self, now: float, pose, robot_still: bool, prefer=None):
         """``pose``: ``(x, y, yaw)`` if the robot currently trusts its pose
         (fresh tag fix or valid dead reckoning), else None.
+
+        ``prefer``: the tag this goto is heading for. Whenever it can be seen
+        it is the one to look at, however face-on: the robot's position
+        relative to THAT tag is what the goto needs, and looking away from
+        it at better-angled but distant tags lost the fix altogether.
 
         Returns the pan angle (rad) to command now, or None for no change.
         """
@@ -147,6 +152,15 @@ class TagAimer:
                 > cfg.look_timeout_sec):
             self._failed[self.target_id] = now + cfg.fail_cooldown_sec
             self.target_id = None
+
+        if (prefer is not None and prefer in self.tag_map
+                and self._failed.get(prefer, 0.0) <= now):
+            s, pan = self.score(prefer, pose)
+            if s > 0.0:
+                if self.target_id != prefer:
+                    self.target_id = prefer
+                    self._target_since = now
+                return self._retarget(pan, now)
 
         best_id, best_score, best_pan = None, 0.0, 0.0
         cur_score, cur_pan = 0.0, 0.0

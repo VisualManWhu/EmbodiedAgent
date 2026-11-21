@@ -301,3 +301,29 @@ def test_one_block_report_does_not_overturn_ground_the_robot_has_driven():
     assert g.state_at((1.5, 1.0)) == DANGER
     # ground never driven is marked at the first report
     assert g.mark_blocked((1.0, 2.0, 0.0)) == (1.5, 2.0)
+
+
+def test_stuck_marks_the_node_under_the_robot_and_the_one_ahead():
+    """Field: caught on a chair leg the sonar never saw. Two nodes, not a
+    patch — it happened beside a goal, in a passage."""
+    g = _grid()
+    g.mark_path((1.0, 1.0), (1.0, 1.0))                 # it drove here
+    marked = g.mark_stuck((1.0, 1.0, 0.0), confirmed=True)
+    assert sorted(marked) == [(1.0, 1.0), (1.25, 1.0)]
+    assert g.state_at((1.0, 1.0)) == DANGER
+    assert g.state_at((1.25, 1.0)) == DANGER
+    assert g.state_at((1.5, 1.0)) == NEAR               # not a whole patch
+    assert g.state_at((1.0, 1.5)) == UNKNOWN
+    # the robot can still plan its way off the node it is stuck on
+    assert g.plan((1.0, 1.0), (1.0, 2.5)) is not None
+
+
+def test_stuck_judged_by_picture_alone_needs_two_reports_on_driven_ground():
+    g = _grid()
+    g.mark_path((1.0, 1.0), (1.0, 1.0))
+    first = g.mark_stuck((1.0, 1.0, 0.0), confirmed=False)
+    assert first == [(1.25, 1.0)]                       # never driven: marked
+    assert g.state_at((1.0, 1.0)) != DANGER             # driven: not yet
+    second = g.mark_stuck((1.0, 1.0, 0.0), confirmed=False)
+    assert (1.0, 1.0) in second
+    assert g.state_at((1.0, 1.0)) == DANGER

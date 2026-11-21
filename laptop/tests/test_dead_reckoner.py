@@ -142,3 +142,27 @@ def test_straight_and_strafe_do_not_turn():
     assert modeled_yaw_rate(0.15, 0.0, 0.0, W_CMD, W_EFF) == pytest.approx(0.0)
     assert modeled_yaw_rate(0.0, 0.15, 0.0, W_CMD, W_EFF) == pytest.approx(0.0)
     assert modeled_yaw_rate(-0.15, 0.0, 0.0, W_CMD, W_EFF) == pytest.approx(0.0)
+
+
+def test_cancelled_pulse_is_not_integrated():
+    """A pulse during which the robot was stuck must not move the pose."""
+    dr = DeadReckoner()
+    dr.reset((1.0, 1.0, 0.0), t=0.0)
+    dr.record_pulse(vx=0.25, vy=0.0, wz=0.0, seconds=1.8, started_at=0.5)
+    assert dr.pose_at(now=3.0)[0][0] == pytest.approx(1.45, abs=1e-3)
+    dr.cancel_pulse(0.5)
+    assert dr.pose_at(now=3.0)[0] == (1.0, 1.0, 0.0)
+
+
+def test_pulse_cut_short_by_a_block_only_counts_up_to_the_block():
+    dr = DeadReckoner()
+    dr.reset((1.0, 1.0, 0.0), t=0.0)
+    dr.record_pulse(vx=0.25, vy=0.0, wz=0.0, seconds=1.6, started_at=1.0)
+    dr.truncate_pulses(now=1.8)                     # blocked 0.8 s in
+    pose, _ = dr.pose_at(now=5.0)
+    assert pose[0] == pytest.approx(1.0 + 0.25 * 0.8, abs=1e-3)
+    # a pulse that had already finished is left as it was
+    dr.reset((0.0, 0.0, 0.0), t=10.0)
+    dr.record_pulse(vx=0.25, vy=0.0, wz=0.0, seconds=1.0, started_at=10.0)
+    dr.truncate_pulses(now=13.0)
+    assert dr.pose_at(now=14.0)[0][0] == pytest.approx(0.25, abs=1e-3)

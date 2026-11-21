@@ -222,6 +222,36 @@ class TraverseGrid:
         self._set_danger(key, 'obstacle')
         return self._xy(key)
 
+    def mark_stuck(self, pose, confirmed: bool, ahead_m: float = 0.25):
+        """The robot was driving forward and did not move: something it could
+        not sense is holding it. The node it stands on and the one just ahead
+        become danger — two nodes, not a whole patch, so a narrow passage is
+        not sealed off by one chair leg.
+
+        ``confirmed`` — the lack of motion was measured by tag fixes. Then
+        the marks are made outright. Judged from the camera picture alone,
+        ground the robot has already driven needs a second report first.
+        Returns the nodes actually marked.
+        """
+        x, y, yaw = pose
+        keys = []
+        for target in ((x, y), (x + ahead_m * math.cos(yaw),
+                                y + ahead_m * math.sin(yaw))):
+            key = self._key(target)
+            if key is not None and key not in keys:
+                keys.append(key)
+        marked = []
+        for key in keys:
+            n = self.nodes[key]
+            if not confirmed and n['visits'] > 0 and not n['danger']:
+                n['hits'] = n.get('hits', 0) + 1
+                if n['hits'] < 2:
+                    continue
+            n['hits'] = 0
+            self._set_danger(key, 'obstacle')
+            marked.append(self._xy(key))
+        return marked
+
     def mark_trapped(self, pose, radius_m: float = 0.4):
         """The robot is stuck here: the whole patch is somewhere not to go."""
         x, y = pose[0], pose[1]
