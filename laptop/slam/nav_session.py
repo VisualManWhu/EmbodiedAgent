@@ -82,6 +82,14 @@ class NavConfig:
     # turn that in reality overshot by 30 deg. Wait this long for a fix
     # before settling for the dead-reckoned heading.
     final_fix_wait_sec: float = 12.0
+    # Route following (traversability grid). An intermediate waypoint counts
+    # as reached within this radius; only the goal needs arrived_radius_m.
+    waypoint_radius_m: float = 0.3
+    # With a planner behind it, a block is not answered by blind side-steps:
+    # the session backs off and asks for a new route (``needs_replan``),
+    # having told the caller where the obstacle is.
+    replan_on_block: bool = False
+    max_blocks: int = 8                      # blocks per goto before FAILED
 
 
 @dataclass
@@ -117,7 +125,19 @@ class NavSession:
     _facing: bool = False                    # position reached, now turning
     _face_count: int = 0
     _final_wait_t: float | None = None       # waiting for a fix to confirm
+    # route: intermediate points to pass through on the way to goal_xy
+    waypoints: list = field(default_factory=list)
+    route_ready: bool = False                # a route has been planned
+    needs_replan: bool = False               # blocked: caller must re-plan
+    blocks_total: int = 0
     _last_goal_dist: float = float('inf')    # map distance at the last tick
+
+    def set_route(self, waypoints):
+        """Intermediate points to drive through, in order, before the goal
+        (the goal itself is not included)."""
+        self.waypoints = [(float(x), float(y)) for x, y in waypoints]
+        self.route_ready = True
+        self.needs_replan = False
 
     def on_tag_fix(self, t: float):
         """Record that a tag-fix arrived at time ``t``.
@@ -148,11 +168,30 @@ class NavSession:
             # A front block on the goal itself is an arrival, not an obstacle:
             # treat it as ARRIVED when the camera sees the goal class close
             # ahead, or the map puts us near the goal landmark.
-            if side == 'front' and (
+            # ...but only for a goal that IS an object. A goal with a final
+            # heading is a spot on the floor to stand on and look from (a tag
+            # standoff): bumping into something near it is not arriving, and
+            # ending there skipped the turn to face the tag.
+            if (side == 'front' and self.final_yaw is None and (
                     self._target_ahead
                     or self._last_goal_dist
-                    < self.config.blocked_arrival_dist_m):
+                    < self.config.blocked_arrival_dist_m)):
                 self.state = State.ARRIVED
+                return
+            self.blocks_total += 1
+            if self.config.replan_on_block:
+                if self.blocks_total > self.config.max_blocks:
+                    self.state = State.FAILED
+                    self.fail_reason = 'blocked'
+                    return
+                # back off for clearance, then drive the route the caller
+                # plans around the obstacle
+                self.queued.clear()
+                self.queued.append(NavCommand(
+                    -self.config.v_max, 0.0, 0.0,
+                    self.config.blocked_backup_sec, 'backward'))
+                self.needs_replan = True
+                self.state = State.DRIVING
                 return
             self._handle_blocked(side)
 
@@ -243,10 +282,20 @@ class NavSession:
             self._scan_resume_t = None
 
         x, y, yaw = robot_pose
-        dx, dy = self.goal_xy[0] - x, self.goal_xy[1] - y
+        goal_dist = math.hypot(self.goal_xy[0] - x, self.goal_xy[1] - y)
+        self._last_goal_dist = goal_dist
+        # tick off waypoints already reached; within reach of the goal the
+        # rest of the route no longer matters
+        while self.waypoints and (
+                goal_dist < self.config.arrived_radius_m
+                or math.hypot(self.waypoints[0][0] - x,
+                              self.waypoints[0][1] - y)
+                < self.config.waypoint_radius_m):
+            self.waypoints.pop(0)
+        target = self.waypoints[0] if self.waypoints else self.goal_xy
+        dx, dy = target[0] - x, target[1] - y
         dist = math.hypot(dx, dy)
-        self._last_goal_dist = dist
-        if self._facing or dist < self.config.arrived_radius_m:
+        if self._facing or goal_dist < self.config.arrived_radius_m:
             settling = (self._drive_resume_t is not None
                         and now < self._drive_resume_t)
             if self._facing and settling:

@@ -498,3 +498,26 @@ def test_height_check_is_off_unless_a_camera_height_is_given():
     assert estimate_camera_pose(
         [{'id': 11, 'corners': _corners(floating, 11, OBLIQUE_MAP)}],
         OBLIQUE_MAP, K) is not None
+
+
+def test_map_renderer_draws_grid_nodes_in_their_state_colours():
+    from slam.map_renderer import _NODE, MapRenderer
+    r = MapRenderer()
+    grid = [{'x': 0.0, 'y': 0.0, 'state': 'safe'},
+            {'x': 1.0, 'y': 0.0, 'state': 'unknown'},
+            {'x': 2.0, 'y': 0.0, 'state': 'near'},
+            {'x': 3.0, 'y': 0.0, 'state': 'danger'}]
+    img = r.render([], [], grid=grid, route=[(0.0, 0.5), (3.0, 0.5)])
+    present = {tuple(int(c) for c in px)
+               for px in img.reshape(-1, 3)[::1]}
+    for state in ('safe', 'unknown', 'near', 'danger'):
+        assert _NODE[state] in present, state
+    # red / yellow / blue / green, as specified (BGR)
+    b, g, red = _NODE['danger']
+    assert red > 200 and b < 80 and g < 80
+    b, g, red = _NODE['near']
+    assert red > 200 and g > 200 and b < 80
+    b, g, red = _NODE['unknown']
+    assert b > 200 and red < 100
+    b, g, red = _NODE['safe']
+    assert g > 180 and b < 100 and red < 100

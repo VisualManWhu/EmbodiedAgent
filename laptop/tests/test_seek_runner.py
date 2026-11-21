@@ -31,6 +31,9 @@ def _runner(landmarks=()):
     r._pan_ignored = 0
     r._last_pan = 0.0
     r._deferred_done = None
+    r.grid = None
+    r._prev_fix = None
+    r._last_block = None
     r.tag_map = {}
     r._nav_done_lock = threading.Lock()
     r._nav_done_event = None
@@ -269,3 +272,158 @@ def test_result_is_never_held_forever():
     r._publish_nav_done(130.0)
     r._release_deferred_done(134.5)         # camera never reported centred
     assert r._nav_done_event is not None
+
+
+# ---- traversability grid ---------------------------------------------------
+
+ROOM = {0: {'x': 0.0, 'y': 0.0}, 1: {'x': 4.0, 'y': 0.0},
+        2: {'x': 4.0, 'y': 3.0}, 3: {'x': 0.0, 'y': 3.0}}
+
+
+def _grid_runner(goal=(3.5, 1.5)):
+    from slam.traverse_grid import TraverseGrid
+    r = _runner()
+    r.tag_map = ROOM
+    r.grid = TraverseGrid.from_tags(ROOM, spacing_m=0.25)
+    r.nav_config.replan_on_block = True
+    r.start_goto(goal, None, 'spot')
+    r.session_nav.on_tag_fix(99.0)
+    return r
+
+
+def test_fixes_teach_the_grid_where_the_robot_has_been():
+    from slam.traverse_grid import SAFE, UNKNOWN
+    r = _grid_runner()
+    r._grid_note_fix(0.5, 1.5, 100.0)
+    r._grid_note_fix(1.0, 1.5, 103.0)               # 0.5 m on, 3 s later
+    assert r.grid.state_at((0.75, 1.5)) == SAFE     # the stretch between
+    r._grid_note_fix(3.0, 2.5, 104.0)               # a jump: not a drive
+    assert r.grid.state_at((3.0, 2.5)) == SAFE
+    assert r.grid.state_at((2.0, 2.0)) == UNKNOWN
+
+
+def test_goto_is_planned_once_the_pose_is_known_and_follows_the_route():
+    r = _grid_runner()
+    x = 2.0
+    y = 0.75
+    while y <= 2.25:                                # danger across the middle
+        r.grid.mark_danger_at((x, y))
+        y += 0.25
+    r._plan_route_if_needed(None, True)             # no pose yet: no plan
+    assert r.session_nav.route_ready is False
+    r._plan_route_if_needed((0.5, 1.5, 0.0), False)
+    assert r.session_nav.route_ready is True
+    assert len(r.session_nav.waypoints) >= 1        # it goes round
+    wps = list(r.session_nav.waypoints)
+    r._plan_route_if_needed((0.5, 1.5, 0.0), False) # not re-planned every tick
+    assert r.session_nav.waypoints == wps
+
+
+def test_block_marks_the_obstacle_and_replans_around_it():
+    from slam.traverse_grid import DANGER
+    r = _grid_runner()
+    r._plan_route_if_needed((0.5, 1.5, 0.0), False)
+    # nothing known yet: one straight leg to a node within reach of the goal
+    assert len(r.session_nav.waypoints) == 1
+    assert abs(r.session_nav.waypoints[0][1] - 1.5) < 1e-9
+    r._nav_pose_dbg = ((1.0, 1.5, 0.0), False, False)
+    r._feed_nav_events(['blocked:front'], 110.0)
+    assert r.grid.state_at((1.5, 1.5)) == DANGER    # the node ahead
+    assert r.session_nav.needs_replan is True
+    r._plan_route_if_needed((0.9, 1.5, 0.0), False)
+    assert r.session_nav.needs_replan is False
+    assert len(r.session_nav.waypoints) >= 2        # now it goes round
+
+
+def test_a_few_blocks_mark_obstacles_but_not_the_floor_the_robot_is_on():
+    """Three blocks used to paint the robot's own patch danger. Feeling its
+    way along a wall near the goal tripped that immediately."""
+    from slam.traverse_grid import DANGER
+    r = _grid_runner()
+    r._plan_route_if_needed((0.5, 1.5, 0.0), False)
+    for i in range(3):
+        r._nav_pose_dbg = ((1.0, 1.5, 0.0), False, False)
+        r._feed_nav_events(['blocked:front'], 110.0 + i)
+    assert r.grid.state_at((1.5, 1.5)) == DANGER    # the obstacle ahead
+    assert r.grid.state_at((1.0, 1.5)) != DANGER    # not where it stands
+
+
+def test_goto_that_fails_on_blocks_marks_the_patch_as_a_trap():
+    from slam.traverse_grid import DANGER
+    r = _grid_runner()
+    r.session_nav.config.max_blocks = 2
+    r._plan_route_if_needed((0.5, 1.5, 0.0), False)
+    for i in range(3):
+        if r.session_nav is None:
+            break
+        r._nav_pose_dbg = ((1.0, 1.5, 0.0), False, False)
+        r._feed_nav_events(['blocked:front'], 110.0 + i)
+    assert r.session_nav is None                    # the goto gave up
+    assert r._nav_done_event['reason'] == 'blocked'
+    assert r.grid.state_at((1.0, 1.5)) == DANGER    # stuck here
+
+
+def test_no_route_fails_the_goto_with_a_clear_reason():
+    r = _grid_runner()
+    y = 0.0
+    while y <= 3.0:
+        r.grid.mark_danger_at((2.0, y))             # wall to wall
+        y += 0.25
+    r._plan_route_if_needed((0.5, 1.5, 0.0), False)
+    assert r.session_nav.state is State.FAILED
+    assert r.session_nav.fail_reason == 'no_path'
+    r._publish_nav_done(120.0)
+    assert r._nav_done_event['reason'] == 'no_path'
+
+
+def test_operator_stop_right_after_a_block_marks_the_area_danger():
+    import time as _time
+    from slam.traverse_grid import DANGER, UNKNOWN
+    r = _grid_runner()
+    r._last_block = (_time.time() - 5.0, (2.0, 2.0, 0.0))
+    r.stop_goto()
+    assert r.grid.state_at((2.0, 2.0)) == DANGER
+    # ...but a stop long after any block marks nothing
+    r2 = _grid_runner()
+    r2._last_block = (_time.time() - 300.0, (2.0, 2.0, 0.0))
+    r2.stop_goto()
+    assert r2.grid.state_at((2.0, 2.0)) == UNKNOWN
+
+
+def test_arriving_at_the_goal_by_touching_it_is_not_recorded_as_an_obstacle():
+    from slam.traverse_grid import DANGER
+    r = _grid_runner(goal=(1.5, 1.5))
+    r._plan_route_if_needed((0.5, 1.5, 0.0), False)
+    r.session_nav.tick((1.0, 1.5, 0.0), 100.0)      # 0.5 m from the goal
+    r._nav_pose_dbg = ((1.0, 1.5, 0.0), False, False)
+    r._feed_nav_events(['blocked:front'], 110.0)
+    assert r._nav_done_event['state'] == 'ARRIVED'
+    assert DANGER not in {n['state'] for n in r.grid.snapshot()}
+
+
+def test_clean_forward_pulse_marks_the_dead_reckoned_stretch_safe():
+    from slam.traverse_grid import SAFE, UNKNOWN
+    r = _grid_runner()
+    r._grid_note_fix(0.5, 1.5, 100.0)               # last tag fix
+    r._last_nav_kind = 'forward'
+    r._nav_pose_dbg = ((0.85, 1.5, 0.0), False, False)   # dead-reckoned
+    r._feed_nav_events(['pulse_done'], 103.0)
+    assert r.grid.state_at((0.75, 1.5)) == SAFE
+    # a rotate pulse, or a stale pose, teaches nothing
+    r._last_nav_kind = 'rotate'
+    r._nav_pose_dbg = ((1.5, 1.5, 0.0), False, False)
+    r._feed_nav_events(['pulse_done'], 104.0)
+    r._last_nav_kind = 'forward'
+    r._nav_pose_dbg = ((1.5, 1.5, 0.0), False, True)
+    r._feed_nav_events(['pulse_done'], 105.0)
+    assert r.grid.state_at((1.5, 1.5)) == UNKNOWN
+
+
+def test_block_with_an_untrusted_pose_marks_nothing():
+    from slam.traverse_grid import DANGER
+    r = _grid_runner()
+    r._plan_route_if_needed((0.5, 1.5, 0.0), False)
+    r._nav_pose_dbg = ((1.0, 1.5, 0.0), False, True)     # stale pose
+    r._feed_nav_events(['blocked:front'], 110.0)
+    assert DANGER not in {n['state'] for n in r.grid.snapshot()}
+    assert r.session_nav.needs_replan is True            # still re-plans

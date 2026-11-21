@@ -165,6 +165,26 @@ class SlamRunner:
         # used by Task 7 nav api when filtering class candidates.
         self.landmark_conf_min = nav_overrides.get('landmark_conf_min', 0.7)
         self.tag_standoff_m = nav_overrides.get('tag_standoff_m') or 1.0
+        # Traversability grid the robot learns by driving: nodes it has
+        # crossed are safe, nodes where it was blocked / stuck are danger,
+        # the rest unknown. Gotos are planned over it instead of driven as a
+        # straight line.
+        self.grid = None
+        self.grid_path = os.path.join(os.path.dirname(map_json_path),
+                                      'traverse_grid.json')
+        self._prev_fix = None               # (x, y, t) of the last tag fix
+        self._last_block = None             # (t, pose) of the last block
+        if nav_overrides.get('grid', True):
+            from slam.traverse_grid import TraverseGrid
+            self.grid = TraverseGrid.from_tags(
+                self.tag_map,
+                spacing_m=nav_overrides.get('grid_spacing_m') or 0.25,
+                unknown_weight=nav_overrides.get('unknown_weight') or 3.0)
+            loaded = self.grid.load(self.grid_path)
+            self.nav_config.replan_on_block = True
+            print(f'traversability grid: {len(self.grid.nodes)} nodes at '
+                  f'{self.grid.spacing} m, '
+                  f'{"loaded " + str(self.grid.counts()) if loaded else "new"}')
         # Pan-tilt tag aiming: during navigation the camera looks at tags
         # instead of straight ahead, and a lost pose is first recovered by
         # sweeping the camera rather than rotating the chassis.
@@ -224,6 +244,7 @@ class SlamRunner:
             rx, ry, ryaw = pose['base_xytheta']
             self.renderer.update_path(rx, ry)
             self.last_robot = (rx, ry, ryaw)
+            self._grid_note_fix(rx, ry, now)
 
         if now - self._last_render >= self.RENDER_INTERVAL:
             self._render()
@@ -258,6 +279,7 @@ class SlamRunner:
             self._nav_yaw_ok = bool(located and pose.get('yaw_reliable', True))
             self._nav_fix_tag = pose.get('rotation_tag') if located else None
             hold = self._tick_aimer(now, robot_pose, pose_stale)
+            self._plan_route_if_needed(robot_pose, pose_stale)
             cmd = None
             if not hold:
                 cmd = self.session_nav.tick(robot_pose, now,
@@ -290,6 +312,84 @@ class SlamRunner:
                 nav_status = (f'SEEK-{seek.state.value}'
                               + (f'/{nav_status}' if nav_status else ''))
         return len(tag_dets), located, nav_status
+
+    # ---- traversability grid --------------------------------------------
+
+    def _grid_note_fix(self, x, y, now):
+        """A tag fix is hard evidence the robot is HERE; two fixes close in
+        space and time are evidence it drove the stretch between them. Also
+        fed the dead-reckoned pose at the end of each clean forward pulse:
+        fixes alone are too sparse (19 nodes after a 160 s drive), and one
+        pulse is at most 0.4 m from the last fix."""
+        if self.grid is None:
+            return
+        prev = self._prev_fix
+        if (prev is not None and now - prev[2] <= 15.0
+                and math.hypot(x - prev[0], y - prev[1]) <= 0.7):
+            self.grid.mark_path(prev[:2], (x, y))
+        else:
+            self.grid.mark_path((x, y), (x, y))
+        self._prev_fix = (x, y, now)
+
+    def _plan_route_if_needed(self, robot_pose, pose_stale):
+        nav = self.session_nav
+        if (self.grid is None or nav is None or robot_pose is None
+                or pose_stale or nav.last_tag_t is None):
+            return
+        if nav.route_ready and not nav.needs_replan:
+            return
+        # "close enough to the goal" is good enough for the planner too:
+        # aim for any reachable node inside the arrival radius
+        route = self.grid.plan(
+            robot_pose[:2], nav.goal_xy,
+            goal_radius_m=0.8 * self.nav_config.arrived_radius_m)
+        if route is None:
+            from slam.nav_session import State
+            print(f'[{time.time():.3f}] PLAN-> no route to '
+                  f'({nav.goal_xy[0]:+.2f},{nav.goal_xy[1]:+.2f}) that '
+                  f'avoids danger')
+            nav.state = State.FAILED
+            nav.fail_reason = 'no_path'
+            return
+        info = self.grid.last_plan
+        nav.set_route(route)
+        print(f'[{time.time():.3f}] PLAN-> {info["length_m"]:.2f} m, '
+              f'{info["unknown_frac"]:.0%} unknown, via '
+              + ' '.join(f'({x:+.2f},{y:+.2f})' for x, y in route))
+
+    def _grid_on_block(self, event, now):
+        """Record where the robot was blocked (if it was not simply the goal
+        it had been sent to)."""
+        nav = self.session_nav
+        if (self.grid is None or nav is None or event != 'blocked:front'
+                or not nav.needs_replan):
+            return
+        pose, _located, stale = getattr(self, '_nav_pose_dbg',
+                                        (None, False, True))
+        if pose is None or stale:
+            # no trustworthy pose: we know the robot hit something, but not
+            # where — marking a guess would poison the grid
+            print(f'[{time.time():.3f}] GRID: block ignored (pose not '
+                  f'trusted)')
+            return
+        self._last_block = (now, pose)
+        node = self.grid.mark_blocked(pose)
+        msg = (f'obstacle at ({node[0]:+.2f},{node[1]:+.2f})'
+               if node else 'obstacle off the grid')
+        print(f'[{time.time():.3f}] GRID: {msg}')
+
+    def _grid_on_failed(self, nav):
+        """A goto that died of repeated blocks: the robot really is stuck
+        here, so the patch it is standing in becomes somewhere not to go.
+        (Not after a mere three blocks, as first built: feeling its way
+        along a wall near the goal tripped that at once and painted the
+        open floor the robot was standing on.)"""
+        if (self.grid is None or nav.fail_reason != 'blocked'
+                or self._last_block is None):
+            return
+        n = self.grid.mark_trapped(self._last_block[1])
+        print(f'[{time.time():.3f}] GRID: goto failed on blocks -> {n} nodes '
+              f'around the robot marked danger')
 
     # ---- pan-tilt tag aiming --------------------------------------------
 
@@ -426,8 +526,14 @@ class SlamRunner:
 
     def _render(self):
         robot = self.last_robot
-        img = self.renderer.render(self.tags_payload,
-                                   self.smap.snapshot(), robot)
+        route = None
+        nav = self.session_nav
+        if nav is not None and nav.route_ready and robot is not None:
+            route = [robot[:2]] + list(nav.waypoints) + [nav.goal_xy]
+        img = self.renderer.render(
+            self.tags_payload, self.smap.snapshot(), robot,
+            grid=self.grid.snapshot() if self.grid is not None else None,
+            route=route)
         self.map_server.set_image(img)
 
     def _post(self):
@@ -452,6 +558,11 @@ class SlamRunner:
             self.smap.save(self.map_json_path)
         except OSError as e:
             print(f'warning: could not save semantic map: {e}')
+        if self.grid is not None:
+            try:
+                self.grid.save(self.grid_path)
+            except OSError as e:
+                print(f'warning: could not save traversability grid: {e}')
 
     def _start_nav_api(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -608,6 +719,14 @@ class SlamRunner:
             self.seek = None
         if self.session_nav is not None:
             print('NAV stop')
+            if (self.grid is not None and self._last_block is not None
+                    and time.time() - self._last_block[0] < 30.0):
+                # stopped by the operator right after being blocked: the
+                # strongest "do not go here" signal there is
+                n = self.grid.mark_trapped(self._last_block[1])
+                print(f'GRID: operator stop after a block -> {n} nodes '
+                      f'marked danger')
+                self._last_block = None
             # `stop` (not `nav_stop`): it also re-centres the camera on the Pi
             self._post_pi({'action': 'stop'})
             self.session_nav = None
@@ -617,6 +736,7 @@ class SlamRunner:
         payload = {'action': 'nav_pulse',
                    'vx': cmd.vx, 'vy': cmd.vy, 'wz': cmd.wz,
                    'seconds': cmd.seconds}
+        self._last_nav_kind = cmd.kind
         # timestamp is Unix epoch — same clock as the Pi ROS log stamps,
         # so the two logs can be aligned line-for-line.
         print(f'[{time.time():.3f}] NAV-> {cmd.kind:11s} '
@@ -668,6 +788,13 @@ class SlamRunner:
                 return
             before = self.session_nav.state.value
             self.session_nav.on_pi_event(event)
+            self._grid_on_block(event, now)
+            if (event == 'pulse_done' and self.grid is not None
+                    and getattr(self, '_last_nav_kind', None) == 'forward'):
+                pose, _located, stale = getattr(
+                    self, '_nav_pose_dbg', (None, False, True))
+                if pose is not None and not stale:
+                    self._grid_note_fix(pose[0], pose[1], now)
             print(f'[{time.time():.3f}] NAV<- event={event:16s} '
                   f'{before} -> {self.session_nav.state.value}')
             if self.session_nav.state.value in ('ARRIVED', 'FAILED'):
@@ -687,6 +814,7 @@ class SlamRunner:
         failed = nav.state.value == 'FAILED'
         if failed:
             self._post_pi({'action': 'stop'})       # also re-centres the camera
+            self._grid_on_failed(nav)
         self._recentre_camera(send=not failed)
         from slam.seek_session import SeekState
         if self.seek is not None and self.seek.state is SeekState.NAV:
@@ -842,6 +970,15 @@ def main():
     ap.add_argument('--scan-max-rotations', type=int, default=12,
                     help='scan steps before FAILED(lost); 12 x 30deg = 360deg')
     ap.add_argument('--landmark-conf-min', type=float, default=0.7)
+    ap.add_argument('--no-grid', action='store_true',
+                    help='drive gotos as straight lines (old behaviour) '
+                         'instead of planning over the learned '
+                         'traversability grid')
+    ap.add_argument('--grid-spacing', type=float, default=0.25,
+                    help='traversability grid node spacing (m)')
+    ap.add_argument('--unknown-weight', type=float, default=3.0,
+                    help='how much costlier unknown ground is than ground '
+                         'the robot has already driven (1 = no preference)')
     ap.add_argument('--no-pan-aim', action='store_true',
                     help='keep the camera looking straight ahead during '
                          'navigation (old behaviour) instead of aiming the '
@@ -885,6 +1022,9 @@ def main():
             'landmark_conf_min': args.landmark_conf_min,
             'tag_standoff_m': args.tag_standoff_m,
             'pan_aim': not args.no_pan_aim,
+            'grid': not args.no_grid,
+            'grid_spacing_m': args.grid_spacing,
+            'unknown_weight': args.unknown_weight,
         }
         try:
             slam = SlamRunner(args.pi, args.semantic_port, args.map_port,

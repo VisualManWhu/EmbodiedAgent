@@ -191,6 +191,8 @@ def _nav_result_text(ev):
         if ev.get('via') == 'vision':
             return f'已到达 {label}（视觉确认）' + stale
         return f'已到达 {label}' + (f' (id {gid})' if gid is not None else '')
+    if reason == 'no_path':
+        return f'去 {label} 没有可通行的路径（都被危险区挡住了）'
     if reason == 'not_found':
         return f'没找到 {label}' + stale
     if reason == 'timeout':

@@ -416,3 +416,90 @@ def test_waiting_for_a_fix_does_not_drive_away_from_the_goal():
     assert s.tick((2.0, 0.0, math.pi / 2), 0.0, pose_fresh=False) is None
     # the dead-reckoned position wanders out of the radius meanwhile
     assert s.tick((1.5, 0.0, math.pi / 2), 2.0, pose_fresh=False) is None
+
+
+# ---- route following (traversability grid) -------------------------------
+
+def test_drives_to_the_first_waypoint_not_straight_at_the_goal():
+    s = _sess(goal=(2.0, 0.0), heading_tol_rad=0.35)
+    s.set_route([(0.0, 1.5)])                       # detour to the left first
+    cmd = s.tick((0.0, 0.0, 0.0), 0.0)
+    assert cmd.kind == 'rotate' and cmd.wz > 0      # turns toward +y
+    assert s.route_ready is True
+
+
+def test_reaching_a_waypoint_moves_on_to_the_next_without_arriving():
+    s = _sess(goal=(2.0, 2.0), waypoint_radius_m=0.3, nav_dwell_sec=0.0)
+    s.set_route([(0.0, 2.0)])
+    cmd = s.tick((0.0, 1.85, math.pi / 2), 0.0)     # within 0.3 m of it
+    assert s.waypoints == []
+    assert s.state is not State.ARRIVED
+    assert cmd.kind == 'rotate' and cmd.wz < 0      # now turns toward the goal
+
+
+def test_goal_within_reach_ends_the_route_even_with_waypoints_left():
+    s = _sess(goal=(2.0, 0.0), arrived_radius_m=0.4)
+    s.set_route([(5.0, 5.0)])
+    cmd = s.tick((1.9, 0.0, 0.0), 0.0)
+    assert s.state is State.ARRIVED and cmd.kind == 'stop'
+
+
+def test_block_arrival_near_goal_still_uses_the_goal_not_the_waypoint():
+    s = _sess(goal=(2.0, 0.0), blocked_arrival_dist_m=1.0,
+              replan_on_block=True)
+    s.set_route([(1.6, 0.3)])
+    s.tick((1.4, 0.0, 0.0), 0.0)                    # 0.6 m from the goal
+    s.on_pi_event('blocked:front')
+    assert s.state is State.ARRIVED
+    assert s.needs_replan is False
+
+
+def test_block_with_a_planner_backs_off_and_asks_for_a_new_route():
+    s = _sess(goal=(5.0, 0.0), replan_on_block=True)
+    s.set_route([(2.0, 0.0)])
+    s.tick((0.0, 0.0, 0.0), 0.0)
+    s.on_pi_event('blocked:front')
+    assert s.needs_replan is True
+    assert s.blocks_total == 1
+    assert [c.kind for c in s.queued] == ['backward']    # no blind side-step
+    assert s.state is State.DRIVING
+    s.set_route([(1.0, 1.0), (3.0, 1.0)])
+    assert s.needs_replan is False
+    assert s.waypoints == [(1.0, 1.0), (3.0, 1.0)]
+
+
+def test_too_many_blocks_in_one_goto_finally_fail():
+    s = _sess(goal=(5.0, 0.0), replan_on_block=True, max_blocks=3)
+    s.tick((0.0, 0.0, 0.0), 0.0)
+    for _ in range(3):
+        s.on_pi_event('blocked:front')
+        assert s.state is not State.FAILED
+    s.on_pi_event('blocked:front')
+    assert s.state is State.FAILED and s.fail_reason == 'blocked'
+
+
+def test_without_a_planner_blocks_still_side_step_as_before():
+    s = _sess(goal=(5.0, 0.0))
+    s.tick((0.0, 0.0, 0.0), 0.0)
+    s.on_pi_event('blocked:front')
+    assert 'strafe' in [c.kind for c in s.queued]
+    assert s.needs_replan is False
+
+
+def test_block_near_a_tag_standoff_is_an_obstacle_not_an_arrival():
+    """Field bug: 0.43 m short of the tag-0 standoff the robot touched
+    something, 'arrived', and never turned to face the tag."""
+    s = _facing_sess(final_yaw=math.pi / 2, blocked_arrival_dist_m=1.0,
+                     replan_on_block=True)
+    s.goal_xy = (2.0, 0.0)
+    s.tick((1.4, 0.0, 0.0), 0.0)                    # 0.6 m from the spot
+    s.on_pi_event('blocked:front')
+    assert s.state is not State.ARRIVED
+    assert s.needs_replan is True
+
+
+def test_block_near_an_object_goal_is_still_an_arrival():
+    s = _sess(goal=(2.0, 0.0), blocked_arrival_dist_m=1.0)
+    s.tick((1.4, 0.0, 0.0), 0.0)
+    s.on_pi_event('blocked:front')
+    assert s.state is State.ARRIVED
