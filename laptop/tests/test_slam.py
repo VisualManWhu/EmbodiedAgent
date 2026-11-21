@@ -372,3 +372,81 @@ def test_detection_projected_absurdly_far_is_rejected():
     assert len(smap.landmarks) == 0
     near = np.array([3.0, 0.5, 0.0])
     assert _observe(smap, near, (0.0, 0.0, 0.5)) is not None
+
+
+# --------------------------------------------------------------------------
+# pose_estimator: prefer obliquely viewed tags for orientation
+# --------------------------------------------------------------------------
+
+from slam.pose_estimator import PoseEstimator, tag_incidence_rad  # noqa: E402
+
+OBLIQUE_MAP = {
+    # straight ahead of the camera below, seen face-on
+    10: {'x': 2.0, 'y': 0.0, 'z': 0.3, 'yaw_deg': 180.0, 'size_m': 0.11},
+    # on a side wall, seen at a steep angle
+    11: {'x': 2.0, 'y': 0.55, 'z': 0.3, 'yaw_deg': 270.0, 'size_m': 0.11},
+}
+CAM_TRUE = transforms.make_transform(transforms.R_ROBOT_FROM_OPTICAL,
+                                     [0.8, 0.0, 0.3])
+
+
+def _corners(T_map_cam, tag_id, tag_map):
+    entry = tag_map[tag_id]
+    T_map_tag = tag_pose_in_map(entry)
+    return np.array([project(T_map_cam, transforms.apply_point(T_map_tag, p))
+                     for p in tag_object_points(entry['size_m'])])
+
+
+def _cam_yaw(T):
+    return float(np.arctan2(T[1, 2], T[0, 2]))
+
+
+def _swung_about_tag(T_map_cam, tag_entry, angle):
+    """The camera pose a face-on tag is easily mistaken for: swung around the
+    tag by ``angle``. The tag looks almost identical from there."""
+    c = np.array([tag_entry['x'], tag_entry['y'], 0.0])
+    to = transforms.make_transform(np.eye(3), c)
+    back = transforms.make_transform(np.eye(3), -c)
+    spin = transforms.make_transform(transforms.rot_z(angle), [0, 0, 0])
+    return to @ spin @ back @ T_map_cam
+
+
+def test_incidence_is_zero_face_on_and_large_from_the_side():
+    from slam.pose_estimator import _solve_single
+    for tag_id, lo, hi in ((10, 0.0, 3.0), (11, 55.0, 75.0)):
+        T_cam_tag, _ = _solve_single(_corners(CAM_TRUE, tag_id, OBLIQUE_MAP),
+                                     0.11, K, np.zeros(5))
+        assert lo <= np.degrees(tag_incidence_rad(T_cam_tag)) <= hi
+
+
+def test_orientation_comes_from_the_oblique_tag_not_the_lowest_error_one():
+    """Field result: a tag seen face-on gave headings scattered over 10 deg
+    while tags seen from the side were steady to 0.1 deg — yet the face-on one
+    often had the lower reprojection error and was the one trusted."""
+    wrong = _swung_about_tag(CAM_TRUE, OBLIQUE_MAP[10], np.radians(6.0))
+    rng = np.random.default_rng(0)
+    dets = [
+        # face-on tag: a perfect fit (error ~0) to a pose 6 deg off
+        {'id': 10, 'corners': _corners(wrong, 10, OBLIQUE_MAP)},
+        # oblique tag: the true pose, with a little pixel noise
+        {'id': 11, 'corners': _corners(CAM_TRUE, 11, OBLIQUE_MAP)
+         + rng.normal(0.0, 0.05, (4, 2))},
+    ]
+    T_est, _, n = estimate_camera_pose(dets, OBLIQUE_MAP, K)
+    assert n == 2
+    assert abs(np.degrees(_cam_yaw(T_est) - _cam_yaw(CAM_TRUE))) < 1.5
+
+
+def test_pose_reports_whether_its_heading_is_trustworthy():
+    est = PoseEstimator(OBLIQUE_MAP, K)
+    face_on = est.estimate([{'id': 10,
+                             'corners': _corners(CAM_TRUE, 10, OBLIQUE_MAP)}])
+    assert face_on['yaw_reliable'] is False
+    assert np.degrees(face_on['incidence_rad']) < 5.0
+    side = est.estimate([{'id': 11,
+                          'corners': _corners(CAM_TRUE, 11, OBLIQUE_MAP)}])
+    assert side['yaw_reliable'] is True
+    both = est.estimate([
+        {'id': 10, 'corners': _corners(CAM_TRUE, 10, OBLIQUE_MAP)},
+        {'id': 11, 'corners': _corners(CAM_TRUE, 11, OBLIQUE_MAP)}])
+    assert both['yaw_reliable'] is True

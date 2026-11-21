@@ -31,9 +31,13 @@ class NavConfig:
     w_max: float = 0.5                       # commanded yaw rate (rotate/scan)
     # effective yaw rate the robot ACTUALLY turns at when commanded w_max —
     # open-loop, no encoder, so the commanded number is not the real rate.
-    # Used to compute rotate-pulse durations. Default from the kit's
-    # hand-measured rotate_90_sec: 90 deg / 1.4 s ~= 1.12 rad/s.
-    w_eff: float = 1.12
+    # Used to compute rotate-pulse durations. The kit's hand-measured
+    # rotate_90_sec (90 deg / 1.4 s ~= 1.12 rad/s) proved too low in the
+    # field: four turns checked against tag fixes all overshot by 40-45%
+    # (e.g. a 1.11 s pulse meant for 71 deg turned 103 deg), i.e. ~1.5 rad/s.
+    # It varies with battery voltage and floor, so treat it as approximate —
+    # a tag fix after the turn is what actually settles the heading.
+    w_eff: float = 1.5
     max_pulse_sec: float = 2.5
     min_pulse_sec: float = 0.2
     # forward pulses blend in proportional steering so the robot curves onto
@@ -73,6 +77,11 @@ class NavConfig:
     # and then arrive regardless rather than hunt forever.
     final_heading_tol_rad: float = 0.3
     final_face_max: int = 3
+    # The final heading may only be CONFIRMED by a real tag fix. Dead
+    # reckoning assumes every turn was perfect, so it always "confirms" a
+    # turn that in reality overshot by 30 deg. Wait this long for a fix
+    # before settling for the dead-reckoned heading.
+    final_fix_wait_sec: float = 12.0
 
 
 @dataclass
@@ -107,6 +116,7 @@ class NavSession:
     final_yaw: float | None = None
     _facing: bool = False                    # position reached, now turning
     _face_count: int = 0
+    _final_wait_t: float | None = None       # waiting for a fix to confirm
     _last_goal_dist: float = float('inf')    # map distance at the last tick
 
     def on_tag_fix(self, t: float):
@@ -192,8 +202,11 @@ class NavSession:
         self.state = State.DRIVING
 
     def tick(self, robot_pose, now: float, pose_stale: bool = False,
-             target_ahead: bool = False):
+             target_ahead: bool = False, pose_fresh: bool = True):
         """Produce the next motion pulse, or None if nothing to send.
+
+        ``pose_fresh`` — ``robot_pose`` is a tag fix from this very frame
+        rather than a dead-reckoned extrapolation.
 
         ``target_ahead`` — the camera currently sees the goal's object class
         large and centred (i.e. the thing right in front is the target).
@@ -238,12 +251,23 @@ class NavSession:
                         and now < self._drive_resume_t)
             if self._facing and settling:
                 return None             # let the last facing turn settle
-            if (self.final_yaw is not None
-                    and self._face_count < self.config.final_face_max):
+            if self.final_yaw is not None:
                 err = _wrap(self.final_yaw - yaw)
-                if abs(err) > self.config.final_heading_tol_rad:
+                turn = (abs(err) > self.config.final_heading_tol_rad
+                        and self._face_count < self.config.final_face_max)
+                if not turn and not pose_fresh:
+                    # About to call the heading good on dead reckoning alone
+                    # — hold position and wait for a tag fix to confirm it.
+                    self._facing = True
+                    if self._final_wait_t is None:
+                        self._final_wait_t = now
+                    if (now - self._final_wait_t
+                            < self.config.final_fix_wait_sec):
+                        return None
+                if turn:
                     if settling:
                         return None
+                    self._final_wait_t = None
                     # Position reached; from here on only turn — never drive
                     # off again because the turn nudged us out of the radius.
                     self._facing = True

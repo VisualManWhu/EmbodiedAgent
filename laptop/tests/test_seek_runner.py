@@ -26,6 +26,12 @@ def _runner(landmarks=()):
     r.seek = None
     r._class_hits = {}
     r._class_sight = {}
+    r.aimer = None
+    r._pan_mismatch_since = None
+    r._pan_ignored = 0
+    r._last_pan = 0.0
+    r._deferred_done = None
+    r.tag_map = {}
     r._nav_done_lock = threading.Lock()
     r._nav_done_event = None
     r.last_robot = (0.0, 0.0, 0.0)
@@ -148,3 +154,118 @@ def test_stop_clears_an_active_seek():
     r._tick_seek(r.seek, [], 100.0)
     r.stop_goto()
     assert r.seek is None and r.session_nav is None
+
+
+# ---- pan-tilt tag aiming -------------------------------------------------
+
+AIM_TAGS = {2: {'x': 1.4, 'y': 0.0, 'yaw_deg': 90.0},
+            3: {'x': 3.1, 'y': 0.0, 'yaw_deg': 90.0},
+            4: {'x': 4.3, 'y': 0.0, 'yaw_deg': 90.0}}
+NEAR_WALL = (3.1, 0.9, -1.5708)
+
+
+def _aim_runner():
+    from slam.tag_aimer import TagAimer
+    r = _runner()
+    r.tag_map = AIM_TAGS
+    r.aimer = TagAimer(AIM_TAGS)
+    r.start_goto((0.0, 1.0), None, 'tag0')
+    return r
+
+
+def _pans(r):
+    return [c['yaw'] for c in r.sent if c.get('action') == 'pantilt']
+
+
+def test_lost_pose_sweeps_the_camera_and_holds_the_chassis():
+    r = _aim_runner()
+    assert r._tick_aimer(100.0, None, True) is True          # hold
+    assert _pans(r) == [0.0]                                 # sweep started
+    assert r._tick_aimer(100.3, None, True) is True          # still sweeping
+    r.aimer.sweep_exhausted = True
+    r.aimer._cmd_t = -1e9
+    assert r._tick_aimer(120.0, None, True) is False         # now turn chassis
+
+
+def test_known_pose_aims_at_an_oblique_tag_then_releases_the_chassis():
+    r = _aim_runner()
+    r.session_nav.on_tag_fix(99.0)
+    assert r._tick_aimer(100.0, NEAR_WALL, False) is True    # settling: hold
+    assert len(_pans(r)) == 1 and abs(_pans(r)[0]) > 0.5
+    assert r.aimer.target_id in (2, 4)
+    assert r._tick_aimer(100.7, NEAR_WALL, False) is False   # settled: go
+
+
+def test_camera_is_left_alone_while_a_pulse_is_in_flight():
+    r = _aim_runner()
+    r.session_nav.on_tag_fix(99.0)
+    r.session_nav.state = State.WAITING_PULSE
+    assert r._tick_aimer(100.0, NEAR_WALL, False) is False
+    assert _pans(r) == []
+
+
+def test_frames_taken_while_the_camera_swings_are_rejected():
+    r = _aim_runner()
+    r.session_nav.on_tag_fix(99.0)
+    r._tick_aimer(100.0, NEAR_WALL, False)
+    pan = r.aimer.pan_cmd
+    assert r._frame_pan_valid(0.0, [], 100.1) is False       # old frame
+    assert r._frame_pan_valid(pan, [], 100.3) is False       # servo moving
+    assert r._frame_pan_valid(pan, [{'id': 4}], 100.8) is True
+    assert r.aimer._seen_t == {4: 100.8}
+
+
+def test_pi_that_ignores_pan_commands_disables_aiming_instead_of_stalling():
+    r = _aim_runner()
+    t = 100.0
+    for _ in range(3):
+        r.aimer.pan_cmd = 0.6                # commanded, never acknowledged
+        r._frame_pan_valid(0.0, [], t)
+        r._frame_pan_valid(0.0, [], t + 2.5)
+        t += 10.0
+    assert r.aimer is None
+    assert r._frame_pan_valid(0.0, [], t) is True
+
+
+def test_navigation_end_recentres_the_camera():
+    r = _aim_runner()
+    r.aimer.pan_cmd = 0.7
+    r.session_nav.state = State.ARRIVED
+    r._publish_nav_done(130.0)
+    assert r.sent[-1] == {'action': 'pantilt', 'yaw': 0.0, 'pitch': 0.0}
+    assert r.aimer.pan_cmd == 0.0
+    # a failed goto sends `stop`, which re-centres on the Pi by itself
+    r.start_goto((0.0, 1.0), None, 'tag0')
+    r.aimer.pan_cmd = 0.7
+    r.session_nav.state = State.FAILED
+    r._publish_nav_done(140.0)
+    assert r.sent[-1] == {'action': 'stop'}
+    assert r.aimer.pan_cmd == 0.0
+
+
+def test_result_is_held_back_until_the_camera_is_centred_again():
+    """The bot photographs as soon as it sees the result; that photo must be
+    taken looking forward, not at the side tag the camera was tracking."""
+    r = _aim_runner()
+    r.aimer.pan_cmd = 0.9
+    r._last_pan = 0.9                       # camera still off to the side
+    r.session_nav.state = State.ARRIVED
+    r._publish_nav_done(130.0)
+    assert r._nav_done_event is None
+    r._last_pan = 0.9
+    r._release_deferred_done(130.3)         # still swinging back
+    assert r._nav_done_event is None
+    r._last_pan = 0.0
+    r._release_deferred_done(130.5)         # centred, but only just
+    assert r._nav_done_event is None
+    r._release_deferred_done(131.0)
+    assert r._nav_done_event['state'] == 'ARRIVED'
+
+
+def test_result_is_never_held_forever():
+    r = _aim_runner()
+    r._last_pan = 0.9
+    r.session_nav.state = State.ARRIVED
+    r._publish_nav_done(130.0)
+    r._release_deferred_done(134.5)         # camera never reported centred
+    assert r._nav_done_event is not None

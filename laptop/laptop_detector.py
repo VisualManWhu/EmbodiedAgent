@@ -30,6 +30,7 @@ Run:
 Stop: press q in the preview window, or Ctrl+C.
 """
 import argparse
+import math
 import os
 import threading
 import time
@@ -163,6 +164,22 @@ class SlamRunner:
         # used by Task 7 nav api when filtering class candidates.
         self.landmark_conf_min = nav_overrides.get('landmark_conf_min', 0.7)
         self.tag_standoff_m = nav_overrides.get('tag_standoff_m') or 1.0
+        # Pan-tilt tag aiming: during navigation the camera looks at tags
+        # instead of straight ahead, and a lost pose is first recovered by
+        # sweeping the camera rather than rotating the chassis.
+        self.aimer = None
+        self._pan_mismatch_since = None
+        self._pan_ignored = 0
+        self._last_pan = 0.0
+        self._deferred_done = None          # (event, since) awaiting camera
+        if nav_overrides.get('pan_aim', True):
+            from slam.tag_aimer import TagAimer
+            self.aimer = TagAimer(self.tag_map)
+            # A camera sweep covers ~200 deg, so when it finds nothing the
+            # chassis should turn far, not creep round in 30 deg steps.
+            self.nav_config.scan_rotate_rad = math.radians(150.0)
+            self.nav_config.scan_max_rotations = 5
+            print('pan-tilt tag aiming: on')
         self.session_nav = None                     # NavSession | None
         self.seek = None                            # SeekSession | None
         self._class_hits = {}                       # cls -> deque[timestamp]
@@ -189,8 +206,11 @@ class SlamRunner:
         Returns ``(n_tags_seen, located, nav_status)`` where ``nav_status`` is
         the NavSession state string (or None if no goto is active).
         """
+        self._last_pan = pan_rad
+        self._release_deferred_done(now)
         tag_dets = self.tag_detector.detect(frame)
-        pose = self.pose_est.estimate(tag_dets, pan_rad, tilt_rad)
+        pose = (self.pose_est.estimate(tag_dets, pan_rad, tilt_rad)
+                if self._frame_pan_valid(pan_rad, tag_dets, now) else None)
         located = pose is not None
         if located:
             T_map_cam = pose['T_map_cam']
@@ -227,13 +247,24 @@ class SlamRunner:
                 robot_pose, pose_stale = (rx, ry, ryaw), False
             else:
                 robot_pose, pose_stale = self.dead_reckoner.pose_at(now)
-            target_ahead = self._target_seen_ahead(detections, frame.shape)
+            # "the goal object is right ahead" only means something when the
+            # camera is looking ahead
+            target_ahead = (abs(pan_rad) < 0.09 and self._target_seen_ahead(
+                detections, frame.shape))
             # for the NAV-> log line: where nav believes the robot is
             self._nav_pose_dbg = (robot_pose, located, pose_stale)
-            cmd = self.session_nav.tick(robot_pose, now, pose_stale=pose_stale,
-                                        target_ahead=target_ahead)
+            self._nav_yaw_ok = bool(located and pose.get('yaw_reliable', True))
+            hold = self._tick_aimer(now, robot_pose, pose_stale)
+            cmd = None
+            if not hold:
+                cmd = self.session_nav.tick(robot_pose, now,
+                                            pose_stale=pose_stale,
+                                            target_ahead=target_ahead,
+                                            pose_fresh=located)
             if cmd is not None and cmd.kind != 'stop':
                 self._send_nav(cmd, now)
+                if cmd.kind == 'scan_rotate' and self.aimer is not None:
+                    self.aimer.reset_sweep()    # new heading: sweep again
             self._feed_nav_events(events, now)
             # ARRIVED-on-first-tick (cmd.kind == 'stop') and FAILED('lost')
             # from scan exhaustion reach terminal state WITHOUT a Pi event,
@@ -243,6 +274,12 @@ class SlamRunner:
                 self._publish_nav_done(now)
             if self.session_nav is not None:
                 nav_status = self.session_nav.state.value
+                if self.aimer is not None:
+                    a = self.aimer
+                    nav_status += (
+                        f' cam={math.degrees(a.pan_cmd):+.0f}°'
+                        + (f'->tag{a.target_id}' if a.target_id is not None
+                           else ''))
         seek = self.seek            # local: an api thread may clear it
         if seek is not None:
             self._tick_seek(seek, events, now)
@@ -250,6 +287,96 @@ class SlamRunner:
                 nav_status = (f'SEEK-{seek.state.value}'
                               + (f'/{nav_status}' if nav_status else ''))
         return len(tag_dets), located, nav_status
+
+    # ---- pan-tilt tag aiming --------------------------------------------
+
+    def _frame_pan_valid(self, pan_rad, tag_dets, now):
+        """False while the camera is swinging to a newly commanded angle: the
+        Pi reports the commanded pan immediately, the servo arrives a moment
+        later, and a pose solved in between is simply wrong."""
+        a = self.aimer
+        if a is None:
+            return True
+        if abs(pan_rad - a.pan_cmd) > 2e-3:
+            # Frame predates our command — or the Pi is not following it.
+            if self._pan_mismatch_since is None:
+                self._pan_mismatch_since = now
+            elif now - self._pan_mismatch_since > 2.0:
+                self._pan_ignored += 1
+                print(f'warning: Pi reports pan {math.degrees(pan_rad):+.0f}° '
+                      f'but {math.degrees(a.pan_cmd):+.0f}° was commanded')
+                a.reset()
+                a.pan_cmd = pan_rad
+                self._pan_mismatch_since = None
+                if self._pan_ignored >= 3:
+                    print('warning: Pi is not following pan-tilt commands — '
+                          'tag aiming disabled (deploy the agent_node with '
+                          'the `pantilt` command)')
+                    self.aimer = None
+            return False
+        self._pan_mismatch_since = None
+        if a.settling(now):
+            return False
+        self._pan_ignored = 0
+        a.note_seen([d['id'] for d in tag_dets if d['id'] in self.tag_map],
+                    now)
+        return True
+
+    def _tick_aimer(self, now, robot_pose, pose_stale):
+        """Point the camera for the active goto. Returns True when the chassis
+        must hold still this tick."""
+        a, nav = self.aimer, self.session_nav
+        if a is None or nav is None:
+            return False
+        from slam.nav_session import State
+        still = nav.state is not State.WAITING_PULSE
+        pose_ok = (robot_pose is not None and not pose_stale
+                   and nav.last_tag_t is not None)
+        pan = a.update(now, robot_pose if pose_ok else None, still)
+        if pan is not None:
+            print(f'[{time.time():.3f}] AIM-> pan={math.degrees(pan):+5.0f}°  '
+                  + (f'tag{a.target_id}' if a.target_id is not None
+                     else ('sweep' if not pose_ok else 'ahead')))
+            self._post_pi({'action': 'pantilt', 'yaw': pan, 'pitch': 0.0})
+        # Hold the chassis (a) while the servo settles — the Pi keeps only ONE
+        # pending command, so a nav pulse sent right behind the pan command
+        # would overwrite it — and (b) while a lost-pose camera sweep is
+        # still under way: look around before turning the whole robot.
+        return still and (a.settling(now)
+                          or (not pose_ok and not a.sweep_exhausted))
+
+    def _emit_done(self, ev, now):
+        """Hand a finished goto / seek to the bot — but not while the camera
+        is still pointing at a tag off to the side. The bot photographs the
+        instant it sees the result, and in the field that photo showed the
+        side wall instead of the goal the robot had just turned to face."""
+        if self.aimer is not None and abs(self._last_pan) > 2e-3:
+            self._deferred_done = (ev, now)
+            return
+        with self._nav_done_lock:
+            self._nav_done_event = ev
+
+    def _release_deferred_done(self, now):
+        if self._deferred_done is None:
+            return
+        ev, since = self._deferred_done
+        centred = abs(self._last_pan) < 2e-3 and now - since >= 0.9
+        if centred or now - since > 4.0:        # never hold a result hostage
+            self._deferred_done = None
+            with self._nav_done_lock:
+                self._nav_done_event = ev
+
+    def _recentre_camera(self, send=True):
+        """The camera goes back to straight ahead when navigation ends.
+        ``send=False`` when a Pi command that re-centres it anyway (`stop`,
+        `find`) is about to be sent — two commands in a row would collide in
+        the Pi's single pending-command slot."""
+        a = self.aimer
+        if a is None:
+            return
+        if send and abs(a.pan_cmd) > 1e-6:
+            self._post_pi({'action': 'pantilt', 'yaw': 0.0, 'pitch': 0.0})
+        a.reset()
 
     # ---- class sightings (shared by seek + arrival verification) --------
 
@@ -477,12 +604,10 @@ class SlamRunner:
             self.seek = None
         if self.session_nav is not None:
             print('NAV stop')
-            try:
-                self.http.post(self.cmd_url, json={'action': 'nav_stop'},
-                               timeout=0.5)
-            except Exception:                       # noqa: BLE001
-                pass
+            # `stop` (not `nav_stop`): it also re-centres the camera on the Pi
+            self._post_pi({'action': 'stop'})
             self.session_nav = None
+            self._recentre_camera(send=False)
 
     def _send_nav(self, cmd, now):
         payload = {'action': 'nav_pulse',
@@ -525,7 +650,9 @@ class SlamRunner:
         if pose is None:
             return 'pose=none'
         gx, gy = self.session_nav.goal_xy
-        src = 'tag' if located else ('stale' if stale else 'dr')
+        # 'tag~' = fix from a tag seen face-on: position good, heading shaky
+        src = (('tag' if getattr(self, '_nav_yaw_ok', True) else 'tag~')
+               if located else ('stale' if stale else 'dr'))
         return (f'pose=({pose[0]:+.2f},{pose[1]:+.2f},{pose[2]:+.2f}rad) '
                 f'[{src}] goal_dist='
                 f'{((gx - pose[0]) ** 2 + (gy - pose[1]) ** 2) ** 0.5:.2f}m')
@@ -554,11 +681,8 @@ class SlamRunner:
         self.session_nav = None
         failed = nav.state.value == 'FAILED'
         if failed:
-            try:
-                self.http.post(self.cmd_url,
-                               json={'action': 'nav_stop'}, timeout=0.5)
-            except Exception:
-                pass
+            self._post_pi({'action': 'stop'})       # also re-centres the camera
+        self._recentre_camera(send=not failed)
         from slam.seek_session import SeekState
         if self.seek is not None and self.seek.state is SeekState.NAV:
             # This goto was a leg of a class seek — the seek decides what the
@@ -580,14 +704,14 @@ class SlamRunner:
               'reason': nav.fail_reason if failed else None,
               'seen': seen}
         print(f'[{time.time():.3f}] NAV result: {ev}')
-        with self._nav_done_lock:
-            self._nav_done_event = ev
+        self._emit_done(ev, now)
 
     # ---- class seek: map navigation + visual search as one behaviour ----
 
     def start_seek(self, target_class):
         from slam.seek_session import SeekSession
         self.session_nav = None
+        self._deferred_done = None
         with self._nav_done_lock:
             self._nav_done_event = None
         self.seek = SeekSession(target_class)
@@ -624,6 +748,7 @@ class SlamRunner:
                 self.start_goto((lm['x'], lm['y']), lm['id'], lm['label'])
             elif act[0] == 'nav_cancel':
                 self.session_nav = None     # the next `find` takes the Pi over
+                self._recentre_camera(send=False)   # `find` re-centres it
             elif act[0] == 'stop':
                 self._post_pi({'action': 'stop'})
 
@@ -647,8 +772,7 @@ class SlamRunner:
                   'unseen_ids': list(seek.unseen_ids),
                   'trail': list(seek.trail)}
             print(f'[{time.time():.3f}] SEEK result: {ev}')
-            with self._nav_done_lock:
-                self._nav_done_event = ev
+            self._emit_done(ev, now)
             if self.seek is seek:
                 self.seek = None
 
@@ -700,7 +824,7 @@ def main():
     ap.add_argument('--nav-v-max', type=float, default=0.15)
     ap.add_argument('--nav-w-max', type=float, default=0.5,
                     help='commanded yaw rate for rotate/scan pulses')
-    ap.add_argument('--nav-w-eff', type=float, default=1.12,
+    ap.add_argument('--nav-w-eff', type=float, default=1.5,
                     help='measured real yaw rate at --nav-w-max '
                          '(90deg / rotate_90_sec); sets rotate pulse duration')
     # keep pulses SHORT: a long forward pulse drives a fixed-curvature arc
@@ -713,6 +837,10 @@ def main():
     ap.add_argument('--scan-max-rotations', type=int, default=12,
                     help='scan steps before FAILED(lost); 12 x 30deg = 360deg')
     ap.add_argument('--landmark-conf-min', type=float, default=0.7)
+    ap.add_argument('--no-pan-aim', action='store_true',
+                    help='keep the camera looking straight ahead during '
+                         'navigation (old behaviour) instead of aiming the '
+                         'pan-tilt at AprilTags')
     ap.add_argument('--tag-standoff-m', type=float, default=1.0,
                     help='tag goals (回原点/绕室) stop this far in front of '
                          'the tag, facing it, so the tag stays in view')
@@ -751,6 +879,7 @@ def main():
             'scan_max_rotations': args.scan_max_rotations,
             'landmark_conf_min': args.landmark_conf_min,
             'tag_standoff_m': args.tag_standoff_m,
+            'pan_aim': not args.no_pan_aim,
         }
         try:
             slam = SlamRunner(args.pi, args.semantic_port, args.map_port,

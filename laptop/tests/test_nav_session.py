@@ -378,3 +378,41 @@ def test_no_final_heading_arrives_immediately_as_before():
     s = _sess(arrived_radius_m=0.4)
     cmd = s.tick(robot_pose=(2.0, 0.0, 3.0), now=0.0)
     assert s.state is State.ARRIVED and cmd.kind == 'stop'
+
+
+def test_final_heading_is_not_confirmed_by_dead_reckoning_alone():
+    """Field bug: the facing turn overshot by 32 deg, but dead reckoning
+    assumes a perfect turn, so the robot 'arrived' looking away from the tag
+    it had been sent to face."""
+    s = _facing_sess(final_yaw=math.pi / 2, nav_dwell_sec=0.0,
+                     final_fix_wait_sec=12.0)
+    first = s.tick((2.0, 0.0, 0.0), 0.0)
+    assert first.kind == 'rotate'
+    s.on_pi_event('pulse_done')
+    aligned = (2.0, 0.0, math.pi / 2)
+    # dead reckoning says the turn landed perfectly: not good enough
+    assert s.tick(aligned, 3.0, pose_fresh=False) is None
+    assert s.state is not State.ARRIVED
+    # a real fix says it overshot -> corrective turn
+    cmd = s.tick((2.0, 0.0, math.pi / 2 + 0.55), 5.0, pose_fresh=True)
+    assert cmd.kind == 'rotate' and cmd.wz < 0
+    s.on_pi_event('pulse_done')
+    cmd = s.tick(aligned, 9.0, pose_fresh=True)          # fix confirms it
+    assert s.state is State.ARRIVED and cmd.kind == 'stop'
+
+
+def test_final_heading_settles_for_dead_reckoning_after_waiting_for_a_fix():
+    s = _facing_sess(final_yaw=math.pi / 2, nav_dwell_sec=0.0,
+                     final_fix_wait_sec=12.0)
+    aligned = (2.0, 0.0, math.pi / 2)
+    assert s.tick(aligned, 0.0, pose_fresh=False) is None
+    assert s.tick(aligned, 11.0, pose_fresh=False) is None
+    cmd = s.tick(aligned, 12.5, pose_fresh=False)
+    assert s.state is State.ARRIVED and cmd.kind == 'stop'
+
+
+def test_waiting_for_a_fix_does_not_drive_away_from_the_goal():
+    s = _facing_sess(final_yaw=math.pi / 2, arrived_radius_m=0.4)
+    assert s.tick((2.0, 0.0, math.pi / 2), 0.0, pose_fresh=False) is None
+    # the dead-reckoned position wanders out of the radius meanwhile
+    assert s.tick((1.5, 0.0, math.pi / 2), 2.0, pose_fresh=False) is None
