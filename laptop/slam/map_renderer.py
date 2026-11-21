@@ -23,6 +23,9 @@ _CONFIRMED = (230, 70, 230)
 _TENTATIVE = (215, 150, 215)
 _TEXT = (240, 240, 240)
 _ROUTE = (255, 255, 255)
+_ROBOT_STALE = (150, 150, 150)      # pose too old to trust
+_PATH_BREAK_M = 0.8                 # a jump this big is not driving
+_PATH_MAX_POINTS = 800
 # traversability grid nodes
 _NODE = {'danger': (40, 40, 235),       # red
          'near': (0, 215, 255),         # yellow: next to danger
@@ -38,35 +41,60 @@ class MapRenderer:
         self.px_per_m = px_per_m
         self.margin = margin_px
         self.min_span = min_span_m
-        self.path: list[tuple[float, float]] = []
+        # trail of fixes; None marks a break (the robot was carried, or a
+        # fix was wrong) so no line is drawn across the jump
+        self.path: list = []
 
     def update_path(self, x: float, y: float, min_step_m: float = 0.05):
-        """Append a robot position, skipping near-duplicate points."""
-        if self.path:
-            px, py = self.path[-1]
-            if np.hypot(x - px, y - py) < min_step_m:
+        """Append a robot position, skipping near-duplicate points. A jump
+        too large to have been driven starts a new stretch instead of
+        drawing a line across the room."""
+        last = next((p for p in reversed(self.path) if p is not None), None)
+        if last is not None:
+            d = np.hypot(x - last[0], y - last[1])
+            if d < min_step_m:
                 return
+            if d > _PATH_BREAK_M and self.path[-1] is not None:
+                self.path.append(None)
         self.path.append((float(x), float(y)))
+        if len(self.path) > _PATH_MAX_POINTS:
+            del self.path[:len(self.path) - _PATH_MAX_POINTS]
 
     def render(self, tags: list, landmarks: list, robot=None, grid=None,
-               route=None) -> np.ndarray:
+               route=None, robot_source: str = 'fix', goal=None,
+               status=None) -> np.ndarray:
         """Render to a BGR image. ``tags`` and ``landmarks`` are the dicts from
         ``SemanticMap.snapshot()`` / the tag map; ``robot`` is ``(x, y, yaw)``
         or ``None``. ``grid`` is ``TraverseGrid.snapshot()`` — nodes drawn
         red (danger), yellow (next to danger), blue (unknown), green (safe).
         ``route`` is the planned polyline ``[(x, y), ...]`` if one is active.
+        ``robot_source`` says how good the robot pose is: 'fix' (a tag fix,
+        drawn solid), 'dr' (dead reckoned since the last fix, drawn hollow)
+        or 'stale' (too old to trust, drawn grey). ``goal`` is
+        ``(x, y, label)`` of the active goto; ``status`` a list of text lines
+        for the bottom of the image.
         """
+        # The view is the ROOM: the tags (on its walls) and the grid laid
+        # over them. Everything else is drawn inside that frame and simply
+        # falls off the edge if it lies outside. Sizing the image to fit
+        # every landmark let a few mislocated ones (tens of metres away)
+        # stretch it to 1518 x 4351 px with the room a speck in the middle.
         xs, ys = [], []
         for n in grid or ():
             xs.append(n['x']); ys.append(n['y'])
         for t in tags:
             xs.append(t['x']); ys.append(t['y'])
-        for lm in landmarks:
-            xs.append(lm['x']); ys.append(lm['y'])
-        for (px, py) in self.path:
-            xs.append(px); ys.append(py)
-        if robot is not None:
-            xs.append(robot[0]); ys.append(robot[1])
+        if not xs:
+            # no room to frame (no tags known): fit whatever there is
+            for lm in landmarks:
+                xs.append(lm['x']); ys.append(lm['y'])
+            for p in self.path:
+                if p is not None:
+                    xs.append(p[0]); ys.append(p[1])
+            if robot is not None:
+                xs.append(robot[0]); ys.append(robot[1])
+            if goal is not None:
+                xs.append(goal[0]); ys.append(goal[1])
         if not xs:
             xs, ys = [0.0], [0.0]
 
@@ -96,17 +124,32 @@ class MapRenderer:
                        _NODE.get(n['state'], _NODE['unknown']), -1,
                        cv2.LINE_AA)
 
-        # planned route
+        # robot path — one polyline per unbroken stretch
+        stretch = []
+        for p in list(self.path) + [None]:
+            if p is None:
+                if len(stretch) >= 2:
+                    pts = np.array([to_px(x, y) for x, y in stretch], np.int32)
+                    cv2.polylines(img, [pts], False, _PATH, 2, cv2.LINE_AA)
+                stretch = []
+            else:
+                stretch.append(p)
+
+        # planned route, on top of the trail: from the robot through each
+        # waypoint to the goal
         if route and len(route) >= 2:
             pts = np.array([to_px(x, y) for x, y in route], np.int32)
-            cv2.polylines(img, [pts], False, _ROUTE, 1, cv2.LINE_AA)
-            for u, v in pts[1:]:
-                cv2.circle(img, (int(u), int(v)), 4, _ROUTE, 1, cv2.LINE_AA)
-
-        # robot path
-        if len(self.path) >= 2:
-            pts = np.array([to_px(x, y) for x, y in self.path], np.int32)
-            cv2.polylines(img, [pts], False, _PATH, 2, cv2.LINE_AA)
+            cv2.polylines(img, [pts], False, _ROUTE, 2, cv2.LINE_AA)
+            for u, v in pts[1:-1]:
+                cv2.circle(img, (int(u), int(v)), 5, _ROUTE, 1, cv2.LINE_AA)
+        if goal is not None:
+            u, v = to_px(goal[0], goal[1])
+            cv2.circle(img, (u, v), 9, _ROUTE, 2, cv2.LINE_AA)
+            cv2.circle(img, (u, v), 3, _ROUTE, -1, cv2.LINE_AA)
+            if len(goal) > 2 and goal[2]:
+                cv2.putText(img, f'goal: {goal[2]}', (u + 13, v - 9),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, _ROUTE, 1,
+                            cv2.LINE_AA)
 
         # tags
         for t in tags:
@@ -131,9 +174,19 @@ class MapRenderer:
 
         # robot
         if robot is not None:
-            self._draw_robot(img, to_px, robot)
+            self._draw_robot(img, to_px, robot, robot_source)
 
         self._draw_legend(img, len(tags), len(landmarks), bool(grid))
+        if status:
+            # a solid strip, so landmark labels near the bottom edge cannot
+            # run through the text
+            top = H - 14 - 20 * len(status)
+            cv2.rectangle(img, (0, top), (W, H), (25, 25, 25), -1)
+            cv2.line(img, (0, top), (W, top), _GRID, 1)
+            for i, line in enumerate(reversed(status)):
+                cv2.putText(img, line, (10, H - 12 - 20 * i),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, _TEXT, 1,
+                            cv2.LINE_AA)
         return img
 
     def _draw_grid(self, img, min_x, max_x, min_y, max_y, to_px):
@@ -148,13 +201,21 @@ class MapRenderer:
             cv2.line(img, (0, v), (img.shape[1], v), _GRID, 1)
             y0 += 1.0
 
-    def _draw_robot(self, img, to_px, robot):
+    def _draw_robot(self, img, to_px, robot, source='fix'):
         x, y, yaw = robot
         u, v = to_px(x, y)
         nose = (u + int(22 * np.cos(yaw)), v - int(22 * np.sin(yaw)))
         left = (u + int(13 * np.cos(yaw + 2.5)), v - int(13 * np.sin(yaw + 2.5)))
         right = (u + int(13 * np.cos(yaw - 2.5)), v - int(13 * np.sin(yaw - 2.5)))
-        cv2.fillConvexPoly(img, np.array([nose, left, right], np.int32), _ROBOT)
+        tri = np.array([nose, left, right], np.int32)
+        if source == 'fix':
+            cv2.fillConvexPoly(img, tri, _ROBOT, cv2.LINE_AA)
+        elif source == 'dr':
+            # estimated since the last fix: hollow
+            cv2.fillConvexPoly(img, tri, _BG, cv2.LINE_AA)
+            cv2.polylines(img, [tri], True, _ROBOT, 2, cv2.LINE_AA)
+        else:
+            cv2.fillConvexPoly(img, tri, _ROBOT_STALE, cv2.LINE_AA)
 
     def _draw_legend(self, img, n_tags, n_landmarks, with_nodes=False):
         cv2.putText(img, f'tags:{n_tags}  objects:{n_landmarks}  (1 grid = 1 m)',

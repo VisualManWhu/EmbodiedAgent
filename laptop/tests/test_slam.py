@@ -521,3 +521,126 @@ def test_map_renderer_draws_grid_nodes_in_their_state_colours():
     assert b > 200 and red < 100
     b, g, red = _NODE['safe']
     assert g > 180 and b < 100 and red < 100
+
+
+# --------------------------------------------------------------------------
+# live navigation view
+# --------------------------------------------------------------------------
+
+def _colours(img):
+    return {tuple(int(c) for c in px) for px in img.reshape(-1, 3)}
+
+
+def test_trail_is_broken_at_a_jump_instead_of_drawn_across_the_room():
+    """Field: carrying the robot to a new start drew a straight line clean
+    across the danger zone."""
+    from slam.map_renderer import MapRenderer
+    r = MapRenderer()
+    r.update_path(0.0, 0.0)
+    r.update_path(0.3, 0.0)
+    r.update_path(4.0, 2.0)                     # picked up and put down
+    r.update_path(4.3, 2.0)
+    assert r.path == [(0.0, 0.0), (0.3, 0.0), None, (4.0, 2.0), (4.3, 2.0)]
+    img = r.render([], [])
+    # nothing is drawn at the midpoint of the jump
+    from slam.map_renderer import _PATH
+    mid = img[img.shape[0] // 2 - 6: img.shape[0] // 2 + 6,
+              img.shape[1] // 2 - 6: img.shape[1] // 2 + 6]
+    assert _PATH not in _colours(mid)
+
+
+def test_trail_is_bounded():
+    from slam.map_renderer import _PATH_MAX_POINTS, MapRenderer
+    r = MapRenderer()
+    for i in range(_PATH_MAX_POINTS + 200):
+        r.update_path(i * 0.06, 0.0)
+    assert len(r.path) == _PATH_MAX_POINTS
+
+
+def test_robot_marker_shows_how_good_the_pose_is():
+    from slam.map_renderer import _ROBOT, _ROBOT_STALE, MapRenderer
+    tags = [{'id': 0, 'x': 0.0, 'y': 0.0}, {'id': 1, 'x': 3.0, 'y': 2.0}]
+    robot = (1.5, 1.0, 0.0)
+    def count(img, colour):
+        return int((img.reshape(-1, 3) == colour).all(axis=1).sum())
+
+    fix = MapRenderer().render(tags, [], robot, robot_source='fix')
+    dr = MapRenderer().render(tags, [], robot, robot_source='dr')
+    stale = MapRenderer().render(tags, [], robot, robot_source='stale')
+    # a tag fix: solid in the robot colour
+    assert count(fix, _ROBOT) > 100
+    # too old to trust: the same shape in grey, none of it in the robot colour
+    assert count(stale, _ROBOT) == 0
+    assert count(stale, _ROBOT_STALE) > count(fix, _ROBOT_STALE) + 100
+    # dead reckoned: outline only, so far fewer robot-coloured pixels
+    assert 0 < count(dr, _ROBOT) < count(fix, _ROBOT)
+
+
+def test_goal_route_and_status_are_drawn():
+    from slam.map_renderer import _ROUTE, MapRenderer
+    tags = [{'id': 0, 'x': 0.0, 'y': 0.0}, {'id': 1, 'x': 3.0, 'y': 2.0}]
+    plain = MapRenderer().render(tags, [], (0.5, 0.5, 0.0))
+    img = MapRenderer().render(
+        tags, [], (0.5, 0.5, 0.0), route=[(0.5, 0.5), (1.5, 0.5), (2.5, 1.5)],
+        goal=(2.5, 1.5, 'tag1'), status=['NAV -> tag1', 'pose: tag fix'])
+    assert img.shape == plain.shape
+    assert _ROUTE in _colours(img)
+    assert int((img != plain).any(axis=2).sum()) > 400      # something drawn
+
+
+def test_view_is_framed_on_the_room_not_on_stray_landmarks():
+    """Field bug: a few landmarks mislocated tens of metres away stretched
+    the map to 1518 x 4351 px, the room a speck in the middle."""
+    from slam.map_renderer import MapRenderer
+    tags = [{'id': 0, 'x': 0.0, 'y': 0.0}, {'id': 1, 'x': 5.0, 'y': 3.0}]
+    plain = MapRenderer().render(tags, [])
+    stray = [{'id': 9, 'label': 'fridge', 'x': -7.0, 'y': -30.0,
+              'state': 'TENTATIVE', 'confidence': 1.0}]
+    r = MapRenderer()
+    r.update_path(2.0, 1.0)
+    r.update_path(2.4, 44.0)                        # a wild fix
+    img = r.render(tags, stray, robot=(20.0, 20.0, 0.0),
+                   goal=(60.0, 0.0, 'far'))
+    assert img.shape == plain.shape
+    # with no tags at all there is no room to frame: fit the content
+    loose = MapRenderer().render([], stray + [dict(stray[0], x=9.0, y=5.0)])
+    assert loose.shape[0] > plain.shape[0]
+
+
+def test_fix_outside_the_room_is_rejected():
+    """The tags hang on the walls, so the robot is inside their rectangle.
+    Fixes at y = -30 m had planted landmarks out there."""
+    room = {0: {'x': 0.0, 'y': 0.0, 'z': 0.3, 'yaw_deg': 90.0, 'size_m': 0.11},
+            1: {'x': 4.0, 'y': 0.0, 'z': 0.3, 'yaw_deg': 90.0, 'size_m': 0.11},
+            2: {'x': 4.0, 'y': 3.0, 'z': 0.3, 'yaw_deg': 270.0, 'size_m': 0.11},
+            3: {'x': 0.0, 'y': 3.0, 'z': 0.3, 'yaw_deg': 270.0, 'size_m': 0.11}}
+    est = PoseEstimator(room, K, mount={'forward_m': 0.0, 'lateral_m': 0.0,
+                                        'height_m': 0.3})
+    inside = look_at((2.0, 1.2, 0.3), (0.0, 0.0, 0.3))
+    assert est.estimate([{'id': 0, 'corners': _corners(inside, 0, room)}])
+    # same view of the tag, but from well outside the walls
+    outside = look_at((-2.5, 2.0, 0.3), (0.0, 0.0, 0.3))
+    assert est.estimate(
+        [{'id': 0, 'corners': _corners(outside, 0, room)}]) is None
+    assert est.rejected_outside == 1
+    # too few tags to define a room: no such check
+    lone = PoseEstimator({0: room[0]}, K, mount={'forward_m': 0.0,
+                                                 'lateral_m': 0.0,
+                                                 'height_m': 0.3})
+    assert lone.estimate([{'id': 0, 'corners': _corners(outside, 0, room)}])
+
+
+def test_objects_are_only_mapped_inside_the_room(tmp_path):
+    cfg = FusionConfig(bounds=(0.0, 0.0, 4.0, 3.0))
+    smap = SemanticMap(cfg)
+    assert _observe(smap, np.array([2.0, 1.5, 0.0]), (0.5, 0.5, 0.5))
+    assert _observe(smap, np.array([6.5, 1.5, 0.0]), (3.5, 1.5, 0.5)) is None
+    assert len(smap.landmarks) == 1
+    # mislocated landmarks already on disk are dropped when loading
+    free = SemanticMap()
+    _observe(free, np.array([2.0, 1.5, 0.0]), (0.5, 0.5, 0.5))
+    _observe(free, np.array([-3.0, -6.0, 0.0]), (-1.0, -4.0, 0.5))
+    f = tmp_path / 'map.json'
+    free.save(str(f))
+    assert len(SemanticMap.load(str(f)).landmarks) == 2
+    assert len(SemanticMap.load(str(f), cfg).landmarks) == 1

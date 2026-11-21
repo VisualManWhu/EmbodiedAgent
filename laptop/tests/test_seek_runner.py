@@ -42,6 +42,12 @@ def _runner(landmarks=()):
     r.dead_reckoner = DeadReckoner()
     r._stuck = None
     r._cur_sig = None
+    r._live_pose = None
+    r._live_src = 'stale'
+    r._live_fix_t = None
+    r.map_img = None
+    r.camera_ok = True
+    r._last_render = 0.0
     r.calib_path = os.path.join(tempfile.mkdtemp(), 'motion_calib.csv')
     r.tag_map = {}
     r._nav_done_lock = threading.Lock()
@@ -679,3 +685,89 @@ def test_block_event_truncates_dead_reckoning():
     assert cut == []
     r._feed_nav_events(['blocked:front'], 110.0)
     assert cut == [110.0]
+
+
+# ---- live navigation view ----------------------------------------------------
+
+def test_live_pose_prefers_a_fix_then_dead_reckoning_then_the_last_fix():
+    r = _runner()
+    r.last_robot = (0.0, 0.0, 0.0)
+    r._note_live_pose(None, False, True, 100.0)          # nothing yet: last fix
+    assert r._live_pose == (0.0, 0.0, 0.0) and r._live_src == 'stale'
+    r._note_live_pose((1.0, 1.0, 0.5), True, False, 101.0)
+    assert r._live_pose == (1.0, 1.0, 0.5) and r._live_src == 'fix'
+    r.start_goto((3.0, 1.0), None, 'spot')
+    r._note_live_pose((1.4, 1.0, 0.5), False, False, 103.0)   # driving on DR
+    assert r._live_pose == (1.4, 1.0, 0.5) and r._live_src == 'dr'
+    r._note_live_pose((1.4, 1.0, 0.5), False, True, 110.0)    # DR expired
+    assert r._live_src == 'stale'
+
+
+def test_idle_robot_with_an_old_fix_is_shown_as_stale():
+    r = _runner()
+    r._note_live_pose((1.0, 1.0, 0.0), True, True, 100.0)
+    assert r._live_src == 'fix'
+    r._note_live_pose(None, False, True, 100.5)          # still fresh
+    assert r._live_src == 'fix'
+    r._note_live_pose(None, False, True, 105.0)
+    assert r._live_src == 'stale'
+    assert r._live_pose == (1.0, 1.0, 0.0)               # position is kept
+
+
+def test_nav_view_reports_route_goal_and_pose_quality():
+    r = _runner()
+    r.last_robot = None
+    assert r._nav_view(100.0) == (None, 'stale', None, None,
+                                  ['idle', 'pose: not localized yet'])
+    r._note_live_pose((1.0, 1.0, 0.0), True, False, 100.0)
+    r.start_goto((3.0, 1.0), None, 'tag4')
+    r.session_nav.set_route([(2.0, 2.0)])
+    robot, src, route, goal, lines = r._nav_view(100.2)
+    assert robot == (1.0, 1.0, 0.0) and src == 'fix'
+    assert route == [(1.0, 1.0), (2.0, 2.0), (3.0, 1.0)]
+    assert goal == (3.0, 1.0, 'tag4')
+    assert lines[0].startswith('NAV -> tag4   2.8 m along route (2.0 m direct)')
+    assert lines[-1] == 'pose: tag fix'
+    r._note_live_pose((1.3, 1.0, 0.0), False, False, 104.0)
+    assert r._nav_view(104.0)[4][-1] == (
+        'pose: dead reckoning, 4 s since the last fix')
+
+
+def test_render_keeps_the_latest_map_for_the_window():
+    from slam.map_renderer import MapRenderer
+    r = _runner()
+    r.renderer = MapRenderer()
+    r.tags_payload = [{'id': 0, 'x': 0.0, 'y': 0.0},
+                      {'id': 1, 'x': 3.0, 'y': 2.0}]
+    r.smap = types.SimpleNamespace(landmarks={}, snapshot=lambda **k: [])
+    served = []
+    r.map_server = types.SimpleNamespace(set_image=served.append)
+    r._note_live_pose((1.0, 1.0, 0.0), True, False, 100.0)
+    r.start_goto((2.5, 1.5), None, 'tag1')
+    r._render()
+    assert r.map_img is not None and r.map_img.ndim == 3
+    assert served and served[0] is r.map_img
+
+
+def test_map_keeps_rendering_while_the_robot_is_offline():
+    """The navigation window used to stay closed until the first camera
+    frame: with the Pi down there was nothing to look at."""
+    from slam.map_renderer import MapRenderer
+    r = _runner()
+    r.renderer = MapRenderer()
+    r.tags_payload = [{'id': 0, 'x': 0.0, 'y': 0.0},
+                      {'id': 1, 'x': 3.0, 'y': 2.0}]
+    r.smap = types.SimpleNamespace(landmarks={}, snapshot=lambda **k: [])
+    r.map_server = types.SimpleNamespace(set_image=lambda img: None)
+    captured = []
+    real = r.renderer.render
+    r.renderer.render = lambda *a, **k: (captured.append(k.get('status')),
+                                         real(*a, **k))[1]
+    r._note_live_pose((1.0, 1.0, 0.0), True, False, 90.0)
+    r.render_offline(100.0)
+    assert r.map_img is not None and r.camera_ok is False
+    assert captured[-1][-1].startswith('camera: no frames')
+    assert r._live_src == 'stale' and r._live_pose == (1.0, 1.0, 0.0)
+    n = len(captured)
+    r.render_offline(100.1)                         # rate limited
+    assert len(captured) == n
