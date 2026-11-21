@@ -75,18 +75,63 @@ def _solve_single(corners: np.ndarray, size_m: float, K: np.ndarray,
     return transforms.from_rvec_tvec(rvec, tvec), err
 
 
-def estimate_camera_pose(tag_detections, tag_map, K, dist=None):
+# A tag's orientation is recovered from how its square is foreshortened. Seen
+# face-on there is almost no foreshortening to measure, so the heading it
+# yields is ill-conditioned — and its reprojection error is still tiny,
+# because many different orientations fit the four corners equally well.
+# Field data, robot stationary: one tag at ~5 deg incidence gave headings
+# scattered over 10 deg; tags at 54-63 deg were steady to 0.1 deg.
+YAW_RELIABLE_INCIDENCE_RAD = np.radians(20.0)
+_INCIDENCE_SATURATION_RAD = np.radians(60.0)    # more oblique = no better
+
+
+def tag_incidence_rad(T_cam_tag: np.ndarray) -> float:
+    """Viewing angle of a tag: 0 = seen face-on, pi/2 = seen edge-on."""
+    normal = T_cam_tag[:3, 2]
+    to_cam = -T_cam_tag[:3, 3]
+    n = np.linalg.norm(to_cam)
+    if n < 1e-9:
+        return 0.0
+    return float(np.arccos(np.clip(normal @ (to_cam / n), -1.0, 1.0)))
+
+
+def _tag_weight(incidence_rad: float, err_px: float) -> float:
+    """How much to trust one tag's pose: oblique and well-fitted is best. The
+    small floors keep a lone face-on tag usable (its POSITION is still good)
+    and stop a near-zero reprojection error from dominating everything."""
+    oblique = np.sin(min(incidence_rad, _INCIDENCE_SATURATION_RAD))
+    return float((oblique + 0.05) / (err_px + 0.2))
+
+
+# The camera rides at a fixed height above the floor. A solved pose that puts
+# it well above or below that is not a noisy fix, it is a wrong one — the
+# mirror-image solution of the planar pose problem, or a far, tiny tag. Field
+# data: wrong solutions sat at 0.30-0.86 m, right ones at 0.10-0.21 m (true
+# 0.15 m).
+CAM_HEIGHT_TOL_M = 0.12
+
+
+def estimate_camera_pose(tag_detections, tag_map, K, dist=None, details=None,
+                         cam_height_m=None, height_tol_m=CAM_HEIGHT_TOL_M):
     """Camera pose ``T_map_cam`` from detected tags with known map poses.
 
     ``tag_detections`` — list of ``{'id': int, 'corners': 4x2 pixels}``.
     ``tag_map`` — ``{id: {x, y, z, yaw_deg, size_m}}``.
     Returns ``(T_map_cam, reproj_error_px, n_tags_used)`` or ``None`` if no
     detected tag has a known map pose / all solves fail.
+
+    If ``details`` is a dict it is filled with ``incidence_rad`` (viewing
+    angle of the tag the orientation was taken from), ``rotation_tag`` and
+    ``n_rejected``.
+
+    With ``cam_height_m`` given, a tag whose solution puts the camera more
+    than ``height_tol_m`` away from that height is discarded as impossible.
     """
     K = np.asarray(K, dtype=np.float64)
     dist = np.zeros(5) if dist is None else np.asarray(dist, dtype=np.float64)
 
-    estimates = []   # (T_map_cam, error)
+    estimates = []   # (T_map_cam, error, weight, incidence, tag id)
+    rejected = 0
     for det in tag_detections:
         entry = tag_map.get(det['id'])
         if entry is None:
@@ -96,23 +141,36 @@ def estimate_camera_pose(tag_detections, tag_map, K, dist=None):
             continue
         T_cam_tag, err = solved
         T_map_cam = tag_pose_in_map(entry) @ transforms.invert(T_cam_tag)
-        estimates.append((T_map_cam, err))
+        if (cam_height_m is not None
+                and abs(T_map_cam[2, 3] - cam_height_m) > height_tol_m):
+            rejected += 1
+            continue
+        inc = tag_incidence_rad(T_cam_tag)
+        estimates.append((T_map_cam, err, _tag_weight(inc, err), inc,
+                          det['id']))
 
+    if details is not None:
+        details['n_rejected'] = rejected
     if not estimates:
         return None
 
-    estimates.sort(key=lambda e: e[1])
-    best_T, best_err = estimates[0]
+    # Orientation from the most trustworthy tag — the obliquely viewed one,
+    # NOT merely the one with the lowest reprojection error.
+    estimates.sort(key=lambda e: -e[2])
+    best_T, best_err, _, best_inc, best_id = estimates[0]
+    if details is not None:
+        details['incidence_rad'] = best_inc
+        details['rotation_tag'] = best_id
     if len(estimates) == 1:
         return best_T, best_err, 1
 
-    # translation: inverse-error-weighted mean; rotation: lowest-error tag.
-    weights = np.array([1.0 / (e + 1e-6) for _, e in estimates])
+    # translation: mean weighted the same way.
+    weights = np.array([e[2] for e in estimates])
     weights /= weights.sum()
-    t = sum(w * T[:3, 3] for w, (T, _) in zip(weights, estimates))
+    t = sum(w * e[0][:3, 3] for w, e in zip(weights, estimates))
     fused = best_T.copy()
     fused[:3, 3] = t
-    mean_err = float(np.mean([e for _, e in estimates]))
+    mean_err = float(np.mean([e[1] for e in estimates]))
     return fused, mean_err, len(estimates)
 
 
@@ -132,10 +190,15 @@ class PoseEstimator:
         """Return a pose dict or ``None`` if no known tag is visible.
 
         Keys: ``T_map_cam`` (4x4), ``T_map_base`` (4x4), ``base_xytheta``
-        ``(x, y, yaw)``, ``reproj_error``, ``n_tags``.
+        ``(x, y, yaw)``, ``reproj_error``, ``n_tags``, ``incidence_rad``
+        (viewing angle of the tag the heading came from), ``rotation_tag``,
+        and ``yaw_reliable`` — False when that tag was seen too face-on for
+        its heading to be trusted (the position is still usable).
         """
-        result = estimate_camera_pose(tag_detections, self.tag_map,
-                                      self.K, self.dist)
+        details = {}
+        result = estimate_camera_pose(
+            tag_detections, self.tag_map, self.K, self.dist, details=details,
+            cam_height_m=self.mount.get('height_m'))
         if result is None:
             return None
         T_map_cam, err, n = result
@@ -148,4 +211,9 @@ class PoseEstimator:
             'base_xytheta': transforms.pose_xytheta(T_map_base),
             'reproj_error': err,
             'n_tags': n,
+            'incidence_rad': details['incidence_rad'],
+            'rotation_tag': details['rotation_tag'],
+            'n_rejected': details['n_rejected'],
+            'yaw_reliable': bool(details['incidence_rad']
+                                 >= YAW_RELIABLE_INCIDENCE_RAD),
         }

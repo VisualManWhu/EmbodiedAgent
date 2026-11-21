@@ -360,3 +360,164 @@ def test_persistence_roundtrip(tmp_path):
     assert b.label == a.label
     assert np.allclose(b.position, a.position)
     assert b.obs_count == a.obs_count
+
+
+def test_detection_projected_absurdly_far_is_rejected():
+    """Field bug: a bbox whose bottom edge sits near the horizon intersects
+    the ground hundreds of metres away. One such landmark at (96, -278) blew
+    the rendered map up to 31070 x 10662 px."""
+    smap = SemanticMap()
+    far = np.array([120.0, 3.0, 0.0])
+    assert _observe(smap, far, (0.0, 0.0, 0.5)) is None
+    assert len(smap.landmarks) == 0
+    near = np.array([3.0, 0.5, 0.0])
+    assert _observe(smap, near, (0.0, 0.0, 0.5)) is not None
+
+
+# --------------------------------------------------------------------------
+# pose_estimator: prefer obliquely viewed tags for orientation
+# --------------------------------------------------------------------------
+
+from slam.pose_estimator import PoseEstimator, tag_incidence_rad  # noqa: E402
+
+OBLIQUE_MAP = {
+    # straight ahead of the camera below, seen face-on
+    10: {'x': 2.0, 'y': 0.0, 'z': 0.3, 'yaw_deg': 180.0, 'size_m': 0.11},
+    # on a side wall, seen at a steep angle
+    11: {'x': 2.0, 'y': 0.55, 'z': 0.3, 'yaw_deg': 270.0, 'size_m': 0.11},
+}
+CAM_TRUE = transforms.make_transform(transforms.R_ROBOT_FROM_OPTICAL,
+                                     [0.8, 0.0, 0.3])
+
+
+def _corners(T_map_cam, tag_id, tag_map):
+    entry = tag_map[tag_id]
+    T_map_tag = tag_pose_in_map(entry)
+    return np.array([project(T_map_cam, transforms.apply_point(T_map_tag, p))
+                     for p in tag_object_points(entry['size_m'])])
+
+
+def _cam_yaw(T):
+    return float(np.arctan2(T[1, 2], T[0, 2]))
+
+
+def _swung_about_tag(T_map_cam, tag_entry, angle):
+    """The camera pose a face-on tag is easily mistaken for: swung around the
+    tag by ``angle``. The tag looks almost identical from there."""
+    c = np.array([tag_entry['x'], tag_entry['y'], 0.0])
+    to = transforms.make_transform(np.eye(3), c)
+    back = transforms.make_transform(np.eye(3), -c)
+    spin = transforms.make_transform(transforms.rot_z(angle), [0, 0, 0])
+    return to @ spin @ back @ T_map_cam
+
+
+def test_incidence_is_zero_face_on_and_large_from_the_side():
+    from slam.pose_estimator import _solve_single
+    for tag_id, lo, hi in ((10, 0.0, 3.0), (11, 55.0, 75.0)):
+        T_cam_tag, _ = _solve_single(_corners(CAM_TRUE, tag_id, OBLIQUE_MAP),
+                                     0.11, K, np.zeros(5))
+        assert lo <= np.degrees(tag_incidence_rad(T_cam_tag)) <= hi
+
+
+def test_orientation_comes_from_the_oblique_tag_not_the_lowest_error_one():
+    """Field result: a tag seen face-on gave headings scattered over 10 deg
+    while tags seen from the side were steady to 0.1 deg — yet the face-on one
+    often had the lower reprojection error and was the one trusted."""
+    wrong = _swung_about_tag(CAM_TRUE, OBLIQUE_MAP[10], np.radians(6.0))
+    rng = np.random.default_rng(0)
+    dets = [
+        # face-on tag: a perfect fit (error ~0) to a pose 6 deg off
+        {'id': 10, 'corners': _corners(wrong, 10, OBLIQUE_MAP)},
+        # oblique tag: the true pose, with a little pixel noise
+        {'id': 11, 'corners': _corners(CAM_TRUE, 11, OBLIQUE_MAP)
+         + rng.normal(0.0, 0.05, (4, 2))},
+    ]
+    T_est, _, n = estimate_camera_pose(dets, OBLIQUE_MAP, K)
+    assert n == 2
+    assert abs(np.degrees(_cam_yaw(T_est) - _cam_yaw(CAM_TRUE))) < 1.5
+
+
+def test_pose_reports_whether_its_heading_is_trustworthy():
+    est = PoseEstimator(OBLIQUE_MAP, K, mount={
+        'forward_m': 0.0, 'lateral_m': 0.0, 'height_m': CAM_TRUE[2, 3]})
+    face_on = est.estimate([{'id': 10,
+                             'corners': _corners(CAM_TRUE, 10, OBLIQUE_MAP)}])
+    assert face_on['yaw_reliable'] is False
+    assert np.degrees(face_on['incidence_rad']) < 5.0
+    side = est.estimate([{'id': 11,
+                          'corners': _corners(CAM_TRUE, 11, OBLIQUE_MAP)}])
+    assert side['yaw_reliable'] is True
+    both = est.estimate([
+        {'id': 10, 'corners': _corners(CAM_TRUE, 10, OBLIQUE_MAP)},
+        {'id': 11, 'corners': _corners(CAM_TRUE, 11, OBLIQUE_MAP)}])
+    assert both['yaw_reliable'] is True
+
+
+# --------------------------------------------------------------------------
+# pose_estimator: reject physically impossible fixes
+# --------------------------------------------------------------------------
+
+def test_fix_that_puts_the_camera_at_an_impossible_height_is_rejected():
+    """The camera rides ~15 cm above the floor, always. Field data: every
+    wrong planar-pose solution put it at 0.30-0.86 m, every right one at
+    0.10-0.21 m. During a room tour such fixes threw the pose 3 m back and
+    forth, one of them outside the room."""
+    good = CAM_TRUE.copy()
+    good[2, 3] = 0.15
+    floating = CAM_TRUE.copy()
+    floating[2, 3] = 0.45
+    est = PoseEstimator(OBLIQUE_MAP, K, mount={'forward_m': 0.0,
+                                               'lateral_m': 0.0,
+                                               'height_m': 0.15})
+    assert est.estimate([{'id': 11,
+                          'corners': _corners(good, 11, OBLIQUE_MAP)}])
+    assert est.estimate([{'id': 11,
+                          'corners': _corners(floating, 11, OBLIQUE_MAP)}]) \
+        is None
+
+
+def test_impossible_tag_is_dropped_but_a_sane_one_still_gives_a_fix():
+    good = CAM_TRUE.copy()
+    good[2, 3] = 0.15
+    floating = CAM_TRUE.copy()
+    floating[2, 3] = 0.45
+    est = PoseEstimator(OBLIQUE_MAP, K, mount={'forward_m': 0.0,
+                                               'lateral_m': 0.0,
+                                               'height_m': 0.15})
+    pose = est.estimate([
+        {'id': 10, 'corners': _corners(floating, 10, OBLIQUE_MAP)},
+        {'id': 11, 'corners': _corners(good, 11, OBLIQUE_MAP)}])
+    assert pose['n_tags'] == 1 and pose['rotation_tag'] == 11
+    assert pose['n_rejected'] == 1
+    assert abs(pose['T_map_cam'][2, 3] - 0.15) < 0.01
+
+
+def test_height_check_is_off_unless_a_camera_height_is_given():
+    floating = CAM_TRUE.copy()
+    floating[2, 3] = 0.45
+    assert estimate_camera_pose(
+        [{'id': 11, 'corners': _corners(floating, 11, OBLIQUE_MAP)}],
+        OBLIQUE_MAP, K) is not None
+
+
+def test_map_renderer_draws_grid_nodes_in_their_state_colours():
+    from slam.map_renderer import _NODE, MapRenderer
+    r = MapRenderer()
+    grid = [{'x': 0.0, 'y': 0.0, 'state': 'safe'},
+            {'x': 1.0, 'y': 0.0, 'state': 'unknown'},
+            {'x': 2.0, 'y': 0.0, 'state': 'near'},
+            {'x': 3.0, 'y': 0.0, 'state': 'danger'}]
+    img = r.render([], [], grid=grid, route=[(0.0, 0.5), (3.0, 0.5)])
+    present = {tuple(int(c) for c in px)
+               for px in img.reshape(-1, 3)[::1]}
+    for state in ('safe', 'unknown', 'near', 'danger'):
+        assert _NODE[state] in present, state
+    # red / yellow / blue / green, as specified (BGR)
+    b, g, red = _NODE['danger']
+    assert red > 200 and b < 80 and g < 80
+    b, g, red = _NODE['near']
+    assert red > 200 and g > 200 and b < 80
+    b, g, red = _NODE['unknown']
+    assert b > 200 and red < 100
+    b, g, red = _NODE['safe']
+    assert g > 180 and b < 100 and red < 100

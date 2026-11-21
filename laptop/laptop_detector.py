@@ -30,6 +30,7 @@ Run:
 Stop: press q in the preview window, or Ctrl+C.
 """
 import argparse
+import math
 import os
 import threading
 import time
@@ -108,6 +109,7 @@ class SlamRunner:
               f'miss={cfg.miss_demote}/{cfg.miss_prune}')
         self.tag_detector = AprilTagDetector()
         mount = {'forward_m': 0.0, 'lateral_m': 0.0, 'height_m': cam_height_m}
+        self.cam_height_m = cam_height_m
         self.pose_est = PoseEstimator(self.tag_map, self.K, self.dist, mount)
 
         self.map_json_path = map_json_path
@@ -143,6 +145,8 @@ class SlamRunner:
         nav_field_map = {
             'arrived_radius_m': 'arrived_radius_m',
             'v_max': 'nav_v_max',
+            'v_eff': 'nav_v_eff',
+            'max_step_m': 'nav_max_step_m',
             'w_max': 'nav_w_max',
             'w_eff': 'nav_w_eff',
             'max_pulse_sec': 'max_pulse_sec',
@@ -154,7 +158,8 @@ class SlamRunner:
             if val is not None:
                 setattr(self.nav_config, cfg_field, val)
         print(f'nav: arrived={self.nav_config.arrived_radius_m}m  '
-              f'v={self.nav_config.v_max}m/s  '
+              f'v_cmd={self.nav_config.v_max}/v_eff={self.nav_config.v_eff}m/s  '
+              f'step<={self.nav_config.max_step_m}m  '
               f'w_cmd={self.nav_config.w_max}/w_eff={self.nav_config.w_eff}rad/s  '
               f'pulse<={self.nav_config.max_pulse_sec}s  '
               f'dr<={dr_time}s/{dr_dist}m  '
@@ -162,7 +167,59 @@ class SlamRunner:
               f'scan_rot<={self.nav_config.scan_max_rotations}')
         # used by Task 7 nav api when filtering class candidates.
         self.landmark_conf_min = nav_overrides.get('landmark_conf_min', 0.7)
+        self.tag_standoff_m = nav_overrides.get('tag_standoff_m') or 1.0
+        # Traversability grid the robot learns by driving: nodes it has
+        # crossed are safe, nodes where it was blocked / stuck are danger,
+        # the rest unknown. Gotos are planned over it instead of driven as a
+        # straight line.
+        self.grid = None
+        self.grid_path = os.path.join(os.path.dirname(map_json_path),
+                                      'traverse_grid.json')
+        self._prev_fix = None               # (x, y, t) of the last tag fix
+        # Motion calibration sampling: what each pulse REALLY did, measured
+        # between a tag fix just before it and one just after.
+        self.calib_path = os.path.join(os.path.dirname(map_json_path),
+                                       'motion_calib.csv')
+        self._last_fix = None               # (t, pose, tag id, yaw_reliable)
+        # Stuck detection: was the last forward pulse followed by motion?
+        self._stuck = None                  # StuckCheck for the pulse in flight
+        self._cur_sig = None                # band-passed view of this frame
+        self._cal = None                    # the pulse being measured
+        self._last_block = None             # (t, pose) of the last block
+        if nav_overrides.get('grid', True):
+            from slam.traverse_grid import TraverseGrid
+            self.grid = TraverseGrid.from_tags(
+                self.tag_map,
+                spacing_m=nav_overrides.get('grid_spacing_m') or 0.25,
+                unknown_weight=nav_overrides.get('unknown_weight') or 3.0)
+            loaded = self.grid.load(self.grid_path)
+            self.nav_config.replan_on_block = True
+            print(f'traversability grid: {len(self.grid.nodes)} nodes at '
+                  f'{self.grid.spacing} m, '
+                  f'{"loaded " + str(self.grid.counts()) if loaded else "new"}')
+        # Pan-tilt tag aiming: during navigation the camera looks at tags
+        # instead of straight ahead, and a lost pose is first recovered by
+        # sweeping the camera rather than rotating the chassis.
+        self.aimer = None
+        self._pan_mismatch_since = None
+        self._pan_ignored = 0
+        self._last_pan = 0.0
+        self._deferred_done = None          # (event, since) awaiting camera
+        if nav_overrides.get('pan_aim', True):
+            from slam.tag_aimer import AimConfig, TagAimer
+            self.aimer = TagAimer(self.tag_map,
+                                  AimConfig(cam_height_m=cam_height_m))
+            # A camera sweep covers ~200 deg, so when it finds nothing the
+            # chassis should turn far, not creep round in 30 deg steps.
+            self.nav_config.scan_rotate_rad = math.radians(150.0)
+            self.nav_config.scan_max_rotations = 5
+            print('pan-tilt tag aiming: on')
         self.session_nav = None                     # NavSession | None
+        self.seek = None                            # SeekSession | None
+        self._class_hits = {}                       # cls -> deque[timestamp]
+        self._class_sight = {}                      # cls -> latest sighting
+        from pi_events import EventCursor
+        self.pi_events = EventCursor()
         self.event_url = f'http://{pi_ip}:9091/status'
         self.cmd_url = f'http://{pi_ip}:9091/command'
         self.http = requests.Session()
@@ -183,8 +240,15 @@ class SlamRunner:
         Returns ``(n_tags_seen, located, nav_status)`` where ``nav_status`` is
         the NavSession state string (or None if no goto is active).
         """
+        self._last_pan = pan_rad
+        self._release_deferred_done(now)
+        if self.session_nav is not None:
+            from slam.stuck_detector import frame_signature
+            self._cur_sig = frame_signature(frame)
         tag_dets = self.tag_detector.detect(frame)
-        pose = self.pose_est.estimate(tag_dets, pan_rad, tilt_rad)
+        frame_ok = self._frame_pan_valid(pan_rad, tag_dets, now)
+        pose = (self.pose_est.estimate(tag_dets, pan_rad, tilt_rad)
+                if frame_ok else None)
         located = pose is not None
         if located:
             T_map_cam = pose['T_map_cam']
@@ -196,6 +260,11 @@ class SlamRunner:
             rx, ry, ryaw = pose['base_xytheta']
             self.renderer.update_path(rx, ry)
             self.last_robot = (rx, ry, ryaw)
+            self._grid_note_fix(rx, ry, now)
+            fix = (now, (rx, ry, ryaw), pose.get('rotation_tag'),
+                   bool(pose.get('yaw_reliable', True)))
+            self._calib_on_fix(fix)
+            self._last_fix = fix
 
         if now - self._last_render >= self.RENDER_INTERVAL:
             self._render()
@@ -207,9 +276,22 @@ class SlamRunner:
             self.save()
             self._last_save = now
 
-        # --- nav update --------------------------------------------------
+        # --- nav / seek update -------------------------------------------
+        self._record_hits(detections, now, frame.shape)
+        events = []
+        if self.session_nav is not None or self.seek is not None:
+            events = self.pi_events.take(self._get_pi_status())
         nav_status = None
         if self.session_nav is not None:
+            # Heading for a tag that is in view: localize against THAT tag
+            # alone. The goal is defined relative to it, so any error in the
+            # tag map cancels, where fixes on other tags disagreed by up to
+            # a metre and 90 degrees right next to tags 5 and 6.
+            goal_pose, goal_bearing = (
+                self._goal_tag_view(tag_dets, pan_rad, tilt_rad)
+                if frame_ok else (None, None))
+            if goal_pose is not None:
+                pose, located = goal_pose, True
             if located:
                 rx, ry, ryaw = pose['base_xytheta']
                 self.dead_reckoner.reset((rx, ry, ryaw), now)
@@ -217,21 +299,385 @@ class SlamRunner:
                 robot_pose, pose_stale = (rx, ry, ryaw), False
             else:
                 robot_pose, pose_stale = self.dead_reckoner.pose_at(now)
-            target_ahead = self._target_seen_ahead(detections, frame.shape)
-            cmd = self.session_nav.tick(robot_pose, now, pose_stale=pose_stale,
-                                        target_ahead=target_ahead)
+            # "the goal object is right ahead" only means something when the
+            # camera is looking ahead
+            target_ahead = (abs(pan_rad) < 0.09 and self._target_seen_ahead(
+                detections, frame.shape))
+            # for the NAV-> log line: where nav believes the robot is
+            self._nav_pose_dbg = (robot_pose, located, pose_stale)
+            self._nav_yaw_ok = bool(located and pose.get('yaw_reliable', True))
+            self._nav_fix_tag = pose.get('rotation_tag') if located else None
+            self._tick_stuck(now, pan_rad, frame_ok,
+                             (rx, ry, ryaw) if located else None)
+            hold = self._tick_aimer(now, robot_pose, pose_stale)
+            self._plan_route_if_needed(robot_pose, pose_stale)
+            cmd = None
+            if not hold:
+                cmd = self.session_nav.tick(robot_pose, now,
+                                            pose_stale=pose_stale,
+                                            target_ahead=target_ahead,
+                                            pose_fresh=located,
+                                            goal_bearing=goal_bearing)
             if cmd is not None and cmd.kind != 'stop':
                 self._send_nav(cmd, now)
-            self._drain_pi_events()
+                if cmd.kind == 'scan_rotate' and self.aimer is not None:
+                    self.aimer.reset_sweep()    # new heading: sweep again
+            self._feed_nav_events(events, now)
             # ARRIVED-on-first-tick (cmd.kind == 'stop') and FAILED('lost')
             # from scan exhaustion reach terminal state WITHOUT a Pi event,
-            # so _drain_pi_events would never publish them — handle directly.
+            # so _feed_nav_events would never publish them — handle directly.
             if (self.session_nav is not None
                     and self.session_nav.state.value in ('ARRIVED', 'FAILED')):
-                self._publish_nav_done()
+                self._publish_nav_done(now)
             if self.session_nav is not None:
                 nav_status = self.session_nav.state.value
+                if self.aimer is not None:
+                    a = self.aimer
+                    nav_status += (
+                        f' cam={math.degrees(a.pan_cmd):+.0f}°'
+                        + (f'->tag{a.target_id}' if a.target_id is not None
+                           else ''))
+        seek = self.seek            # local: an api thread may clear it
+        if seek is not None:
+            self._tick_seek(seek, events, now)
+            if not seek.done:
+                nav_status = (f'SEEK-{seek.state.value}'
+                              + (f'/{nav_status}' if nav_status else ''))
         return len(tag_dets), located, nav_status
+
+    # ---- stuck detection -------------------------------------------------
+
+    STUCK_MIN_PULSE_SEC = 1.0       # shorter pulses move too little to judge
+
+    def _stuck_on_pulse(self, cmd, now):
+        """Start watching a forward pulse: note where the robot believes it
+        is and what the camera sees, to compare once the pulse has run."""
+        self._stuck = None
+        if cmd.kind != 'forward' or cmd.seconds < self.STUCK_MIN_PULSE_SEC:
+            return
+        from slam.stuck_detector import StuckCheck
+        pose = getattr(self, '_nav_pose_dbg', (None,))[0]
+        fix = self._last_fix
+        pre_fix = (fix[1] if fix is not None
+                   and now - fix[0] <= self.CAL_PRE_MAX_AGE else None)
+        self._stuck = StuckCheck(now, cmd.seconds * self.nav_config.v_eff,
+                                 pose, self._cur_sig, self._last_pan,
+                                 pre_fix=pre_fix)
+
+    def _stuck_on_event(self, event, now):
+        if self._stuck is None:
+            return
+        if event == 'pulse_done':
+            self._stuck.on_done(now)
+        elif event.startswith('blocked'):
+            self._stuck = None          # the sensor saw it: handled as a block
+
+    def _tick_stuck(self, now, pan_rad, frame_ok, fix):
+        chk, nav = self._stuck, self.session_nav
+        if chk is None or nav is None:
+            return
+        verdict = chk.evaluate(now, self._cur_sig, pan_rad, frame_ok, fix=fix)
+        if verdict is None:
+            return
+        self._stuck = None
+        ncc = 'n/a' if chk.ncc is None else f'{chk.ncc:.2f}'
+        moved = 'n/a' if chk.moved_m is None else f'{chk.moved_m:+.2f} m'
+        print(f'[{time.time():.3f}] MOTION: {verdict} (by {chk.how})  '
+              f'picture ncc={ncc}  fix displacement={moved}  '
+              f'expected {chk.expected_m:.2f} m')
+        if verdict != 'stuck':
+            return
+        # The robot is where it was when the pulse started, not where dead
+        # reckoning carried it.
+        self.dead_reckoner.cancel_pulse(chk.t0)
+        pose = fix or chk.pre_pose
+        if pose is not None and self.grid is not None:
+            marked = self.grid.mark_stuck(pose, confirmed=chk.how == 'fix')
+            self._last_block = (now, pose)
+            print(f'[{time.time():.3f}] GRID: stuck at ({pose[0]:+.2f},'
+                  f'{pose[1]:+.2f}) -> '
+                  + (' '.join(f'({x:+.2f},{y:+.2f})' for x, y in marked)
+                     + ' marked danger' if marked else
+                     'not marked yet (driven ground, first report)'))
+        nav.on_stuck()
+
+    # ---- motion calibration sampling ------------------------------------
+
+    CAL_PRE_MAX_AGE = 2.5       # fix must be this fresh when the pulse starts
+    CAL_POST_MAX_WAIT = 8.0     # ...and the next one this soon after it ends
+    CAL_SETTLE = 0.4            # let the robot stop before trusting a fix
+
+    def _calib_on_pulse(self, cmd, now):
+        """A pulse is being sent: remember it, with the fix it starts from
+        (if there is a fresh one). Dead reckoning assumes fixed speeds for
+        every pulse; this measures what each one actually did."""
+        pre = self._last_fix
+        if pre is None or now - pre[0] > self.CAL_PRE_MAX_AGE:
+            self._cal = None
+            return
+        self._cal = {'kind': cmd.kind, 'vx': cmd.vx, 'vy': cmd.vy,
+                     'wz': cmd.wz, 'sec': cmd.seconds, 't0': now,
+                     'pre': pre, 'done': None}
+
+    def _calib_on_event(self, event, now):
+        if self._cal is None:
+            return
+        if event == 'pulse_done' and self._cal['done'] is None:
+            self._cal['done'] = now
+        elif event.startswith('blocked'):
+            self._cal = None            # cut short: duration is unknown
+
+    def _calib_on_fix(self, fix):
+        """First fix after the measured pulse finished -> one sample."""
+        cal = self._cal
+        if cal is None or cal['done'] is None:
+            return
+        t, (x, y, yaw), tag, yaw_ok = fix
+        if t < cal['done'] + self.CAL_SETTLE:
+            return
+        self._cal = None
+        if t - cal['done'] > self.CAL_POST_MAX_WAIT:
+            return
+        _t0, (x0, y0, yaw0), tag0, yaw_ok0 = cal['pre']
+        dx, dy = x - x0, y - y0
+        # displacement in the robot's own frame at the start of the pulse
+        fwd = dx * math.cos(yaw0) + dy * math.sin(yaw0)
+        left = -dx * math.sin(yaw0) + dy * math.cos(yaw0)
+        dyaw = math.atan2(math.sin(yaw - yaw0), math.cos(yaw - yaw0))
+        row = {'t': round(cal['t0'], 3), 'kind': cal['kind'],
+               'vx': cal['vx'], 'vy': cal['vy'], 'wz': round(cal['wz'], 3),
+               'sec': round(cal['sec'], 3), 'dist': round(math.hypot(dx, dy), 3),
+               'fwd': round(fwd, 3), 'left': round(left, 3),
+               'dyaw': round(dyaw, 4), 'tag_pre': tag0, 'tag_post': tag,
+               'same_tag': int(tag0 == tag),
+               'yaw_ok': int(yaw_ok0 and yaw_ok)}
+        print(f'[{time.time():.3f}] CAL: {row["kind"]:11s} {row["sec"]:.2f}s  '
+              f'moved {row["dist"]:.2f} m (fwd {fwd:+.2f}, left {left:+.2f}), '
+              f'turned {math.degrees(dyaw):+.0f}°  tag {tag0}->{tag}'
+              f'{"" if row["same_tag"] else "  (different tags)"}')
+        try:
+            new = not os.path.exists(self.calib_path)
+            with open(self.calib_path, 'a', encoding='utf-8') as f:
+                if new:
+                    f.write(','.join(row) + '\n')
+                f.write(','.join(str(v) for v in row.values()) + '\n')
+        except OSError as e:
+            print(f'warning: could not write motion calibration: {e}')
+
+    # ---- traversability grid --------------------------------------------
+
+    def _grid_note_fix(self, x, y, now):
+        """A tag fix is hard evidence the robot is HERE; two fixes close in
+        space and time are evidence it drove the stretch between them. Also
+        fed the dead-reckoned pose at the end of each clean forward pulse:
+        fixes alone are too sparse (19 nodes after a 160 s drive), and one
+        pulse is at most 0.4 m from the last fix."""
+        if self.grid is None:
+            return
+        prev = self._prev_fix
+        if (prev is not None and now - prev[2] <= 15.0
+                and math.hypot(x - prev[0], y - prev[1]) <= 0.7):
+            self.grid.mark_path(prev[:2], (x, y))
+        else:
+            self.grid.mark_path((x, y), (x, y))
+        self._prev_fix = (x, y, now)
+
+    def _plan_route_if_needed(self, robot_pose, pose_stale):
+        nav = self.session_nav
+        if (self.grid is None or nav is None or robot_pose is None
+                or pose_stale or nav.last_tag_t is None):
+            return
+        if nav.route_ready and not nav.needs_replan:
+            return
+        # "close enough to the goal" is good enough for the planner too:
+        # aim for any reachable node inside the arrival radius
+        route = self.grid.plan(
+            robot_pose[:2], nav.goal_xy,
+            goal_radius_m=0.8 * (nav.arrive_radius_m
+                                 or self.nav_config.arrived_radius_m))
+        if route is None:
+            from slam.nav_session import State
+            print(f'[{time.time():.3f}] PLAN-> no route to '
+                  f'({nav.goal_xy[0]:+.2f},{nav.goal_xy[1]:+.2f}) that '
+                  f'avoids danger')
+            nav.state = State.FAILED
+            nav.fail_reason = 'no_path'
+            return
+        info = self.grid.last_plan
+        nav.set_route(route)
+        print(f'[{time.time():.3f}] PLAN-> {info["length_m"]:.2f} m, '
+              f'{info["unknown_frac"]:.0%} unknown, via '
+              + ' '.join(f'({x:+.2f},{y:+.2f})' for x, y in route))
+
+    def _grid_on_block(self, event, now):
+        """Record where the robot was blocked (if it was not simply the goal
+        it had been sent to)."""
+        nav = self.session_nav
+        if (self.grid is None or nav is None or event != 'blocked:front'
+                or not nav.needs_replan):
+            return
+        pose, _located, stale = getattr(self, '_nav_pose_dbg',
+                                        (None, False, True))
+        if pose is None or stale:
+            # no trustworthy pose: we know the robot hit something, but not
+            # where — marking a guess would poison the grid
+            print(f'[{time.time():.3f}] GRID: block ignored (pose not '
+                  f'trusted)')
+            return
+        self._last_block = (now, pose)
+        node = self.grid.mark_blocked(pose)
+        msg = (f'obstacle at ({node[0]:+.2f},{node[1]:+.2f})'
+               if node else 'obstacle off the grid')
+        print(f'[{time.time():.3f}] GRID: {msg}')
+
+    def _grid_on_failed(self, nav):
+        """A goto that died of repeated blocks: the robot really is stuck
+        here, so the patch it is standing in becomes somewhere not to go.
+        (Not after a mere three blocks, as first built: feeling its way
+        along a wall near the goal tripped that at once and painted the
+        open floor the robot was standing on.)"""
+        if (self.grid is None or nav.fail_reason != 'blocked'
+                or self._last_block is None):
+            return
+        n = self.grid.mark_trapped(self._last_block[1])
+        print(f'[{time.time():.3f}] GRID: goto failed on blocks -> {n} nodes '
+              f'around the robot marked danger')
+
+    # ---- pan-tilt tag aiming --------------------------------------------
+
+    def _frame_pan_valid(self, pan_rad, tag_dets, now):
+        """False while the camera is swinging to a newly commanded angle: the
+        Pi reports the commanded pan immediately, the servo arrives a moment
+        later, and a pose solved in between is simply wrong."""
+        a = self.aimer
+        if a is None:
+            return True
+        if abs(pan_rad - a.pan_cmd) > 2e-3:
+            # Frame predates our command — or the Pi is not following it.
+            if self._pan_mismatch_since is None:
+                self._pan_mismatch_since = now
+            elif now - self._pan_mismatch_since > 2.0:
+                self._pan_ignored += 1
+                print(f'warning: Pi reports pan {math.degrees(pan_rad):+.0f}° '
+                      f'but {math.degrees(a.pan_cmd):+.0f}° was commanded')
+                a.reset()
+                a.pan_cmd = pan_rad
+                self._pan_mismatch_since = None
+                if self._pan_ignored >= 3:
+                    print('warning: Pi is not following pan-tilt commands — '
+                          'tag aiming disabled (deploy the agent_node with '
+                          'the `pantilt` command)')
+                    self.aimer = None
+            return False
+        self._pan_mismatch_since = None
+        if a.settling(now):
+            return False
+        self._pan_ignored = 0
+        a.note_seen([d['id'] for d in tag_dets if d['id'] in self.tag_map],
+                    now)
+        return True
+
+    def _goal_tag_view(self, tag_dets, pan_rad, tilt_rad):
+        """``(pose, bearing)`` from the tag the active goto is heading for,
+        if it is in this frame; ``(None, None)`` otherwise. ``pose`` is the
+        usual pose dict solved from that one tag; ``bearing`` is the tag's
+        direction from the robot's heading (rad, + = left), read straight
+        off its position in the picture plus the camera pan."""
+        nav = self.session_nav
+        if nav is None or nav.goal_tag_id is None:
+            return None, None
+        det = next((d for d in tag_dets if d['id'] == nav.goal_tag_id), None)
+        if det is None:
+            return None, None
+        bearing = pan_rad + math.atan2(self.K[0][2] - det['center'][0],
+                                       self.K[0][0])
+        return self.pose_est.estimate([det], pan_rad, tilt_rad), bearing
+
+    def _tick_aimer(self, now, robot_pose, pose_stale):
+        """Point the camera for the active goto. Returns True when the chassis
+        must hold still this tick."""
+        a, nav = self.aimer, self.session_nav
+        if a is None or nav is None:
+            return False
+        from slam.nav_session import State
+        if self._stuck is not None and self._stuck.wants_camera_still(now):
+            return True         # the 'after' picture has not been taken yet
+        still = nav.state is not State.WAITING_PULSE
+        pose_ok = (robot_pose is not None and not pose_stale
+                   and nav.last_tag_t is not None)
+        pan = a.update(now, robot_pose if pose_ok else None, still,
+                       prefer=nav.goal_tag_id)
+        if pan is not None:
+            print(f'[{time.time():.3f}] AIM-> pan={math.degrees(pan):+5.0f}°  '
+                  + (f'tag{a.target_id}' if a.target_id is not None
+                     else ('sweep' if not pose_ok else 'ahead')))
+            self._post_pi({'action': 'pantilt', 'yaw': pan, 'pitch': 0.0})
+        # Hold the chassis (a) while the servo settles — the Pi keeps only ONE
+        # pending command, so a nav pulse sent right behind the pan command
+        # would overwrite it — and (b) while a lost-pose camera sweep is
+        # still under way: look around before turning the whole robot.
+        return still and (a.settling(now)
+                          or (not pose_ok and not a.sweep_exhausted))
+
+    def _emit_done(self, ev, now):
+        """Hand a finished goto / seek to the bot — but not while the camera
+        is still pointing at a tag off to the side. The bot photographs the
+        instant it sees the result, and in the field that photo showed the
+        side wall instead of the goal the robot had just turned to face."""
+        if self.aimer is not None and abs(self._last_pan) > 2e-3:
+            self._deferred_done = (ev, now)
+            return
+        with self._nav_done_lock:
+            self._nav_done_event = ev
+
+    def _release_deferred_done(self, now):
+        if self._deferred_done is None:
+            return
+        ev, since = self._deferred_done
+        centred = abs(self._last_pan) < 2e-3 and now - since >= 0.9
+        if centred or now - since > 4.0:        # never hold a result hostage
+            self._deferred_done = None
+            with self._nav_done_lock:
+                self._nav_done_event = ev
+
+    def _recentre_camera(self, send=True):
+        """The camera goes back to straight ahead when navigation ends.
+        ``send=False`` when a Pi command that re-centres it anyway (`stop`,
+        `find`) is about to be sent — two commands in a row would collide in
+        the Pi's single pending-command slot."""
+        a = self.aimer
+        if a is None:
+            return
+        if send and abs(a.pan_cmd) > 1e-6:
+            self._post_pi({'action': 'pantilt', 'yaw': 0.0, 'pitch': 0.0})
+        a.reset()
+
+    # ---- class sightings (shared by seek + arrival verification) --------
+
+    HITS_KEPT = 20
+
+    def _record_hits(self, detections, now, frame_shape=None):
+        import collections
+        biggest = {}
+        for d in detections:
+            self._class_hits.setdefault(
+                d['cls'], collections.deque(maxlen=self.HITS_KEPT)).append(now)
+            if 'h' in d and d['h'] > biggest.get(d['cls'], {}).get('h', 0.0):
+                biggest[d['cls']] = d
+        if frame_shape is None:
+            return
+        fh = float(frame_shape[0])
+        for cls, d in biggest.items():
+            top, bottom = d['cy'] - d['h'] / 2.0, d['cy'] + d['h'] / 2.0
+            self._class_sight[cls] = {
+                't': now, 'h_frac': d['h'] / fh,
+                'clipped': top <= 0.02 * fh or bottom >= 0.98 * fh}
+
+    def _hits(self, cls):
+        return list(self._class_hits.get(cls, ()))
+
+    def _seen_recently(self, cls, now, window_sec=3.0):
+        return any(t >= now - window_sec for t in self._hits(cls))
 
     def _target_seen_ahead(self, detections, frame_shape):
         """True if YOLO currently sees the active goal's object class large
@@ -251,8 +697,14 @@ class SlamRunner:
 
     def _render(self):
         robot = self.last_robot
-        img = self.renderer.render(self.tags_payload,
-                                   self.smap.snapshot(), robot)
+        route = None
+        nav = self.session_nav
+        if nav is not None and nav.route_ready and robot is not None:
+            route = [robot[:2]] + list(nav.waypoints) + [nav.goal_xy]
+        img = self.renderer.render(
+            self.tags_payload, self.smap.snapshot(), robot,
+            grid=self.grid.snapshot() if self.grid is not None else None,
+            route=route)
         self.map_server.set_image(img)
 
     def _post(self):
@@ -277,6 +729,11 @@ class SlamRunner:
             self.smap.save(self.map_json_path)
         except OSError as e:
             print(f'warning: could not save semantic map: {e}')
+        if self.grid is not None:
+            try:
+                self.grid.save(self.grid_path)
+            except OSError as e:
+                print(f'warning: could not save traversability grid: {e}')
 
     def _start_nav_api(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -310,7 +767,10 @@ class SlamRunner:
                 if self.path == '/nav/candidates':
                     runner._handle_candidates(self)
                 elif self.path == '/nav/goto':
+                    runner.seek = None      # an explicit goto ends any seek
                     runner._handle_goto(self)
+                elif self.path == '/nav/seek':
+                    runner._handle_seek(self)
                 elif self.path == '/nav/stop':
                     runner.stop_goto()
                     self.send_response(200)
@@ -351,7 +811,7 @@ class SlamRunner:
 
     def _handle_goto(self, h):
         import json as _json
-        from slam.landmark_selector import by_id, by_tag
+        from slam.landmark_selector import by_id, tag_standoff
         n = int(h.headers.get('Content-Length', 0))
         req = _json.loads(h.rfile.read(n))
         if 'landmark_id' in req:
@@ -361,14 +821,41 @@ class SlamRunner:
             self.start_goto((float(lm.position[0]), float(lm.position[1])),
                             lm.id, lm.label)
         elif 'tag_id' in req:
-            xy = by_tag(self.tag_map, req['tag_id'])
-            if xy is None:
+            # stop in front of the tag, looking at it — not at the wall it
+            # hangs on, where the camera cannot even see it
+            from slam.landmark_selector import tag_bounds
+            spot = tag_standoff(self.tag_map, req['tag_id'],
+                                self.tag_standoff_m,
+                                cam_height_m=self.cam_height_m,
+                                bounds=tag_bounds(self.tag_map),
+                                avoid=self._standoff_in_danger)
+            if spot is None:
                 h.send_response(404); h.end_headers(); return
-            self.start_goto(xy, None, f"tag{req['tag_id']}")
+            self.start_goto(spot[0], None, f"tag{req['tag_id']}",
+                            final_yaw=spot[1],
+                            goal_tag_id=int(req['tag_id']))
         elif 'xy' in req:
             self.start_goto(tuple(req['xy']), None, req.get('label', 'point'))
         else:
             h.send_response(400); h.end_headers(); return
+        h.send_response(200); h.end_headers()
+
+    def _standoff_in_danger(self, xy):
+        """True if the traversability grid already knows this spot as
+        danger — no point choosing a viewpoint the planner cannot reach."""
+        if self.grid is None:
+            return False
+        from slam.traverse_grid import DANGER
+        return self.grid.state_at(xy) == DANGER
+
+    def _handle_seek(self, h):
+        import json as _json
+        n = int(h.headers.get('Content-Length', 0))
+        req = _json.loads(h.rfile.read(n))
+        cls = req.get('target_class')
+        if not cls:
+            h.send_response(400); h.end_headers(); return
+        self.start_seek(cls)
         h.send_response(200); h.end_headers()
 
     def _handle_landmarks_list(self, h):
@@ -394,35 +881,61 @@ class SlamRunner:
 
     # ---- navigation lifecycle ------------------------------------------
 
-    def start_goto(self, goal_xy, goal_id, goal_label):
+    TAG_ARRIVE_RADIUS_M = 0.3           # tighter than an object goal's
+
+    def start_goto(self, goal_xy, goal_id, goal_label, final_yaw=None,
+                   goal_tag_id=None):
         from slam.nav_session import NavSession
         # NavSession imported lazily so SlamRunner can be constructed without
         # the slam package; only used when --slam, which already imported it.
+        # Skip Pi events from before this goto (a previous session's trailing
+        # pulse_done / blocked must not be fed to the new NavSession).
+        self.pi_events.sync(self._get_pi_status())
         self.session_nav = NavSession(goal_xy=goal_xy, goal_id=goal_id,
                                       goal_label=goal_label,
-                                      config=self.nav_config)
+                                      config=self.nav_config,
+                                      final_yaw=final_yaw,
+                                      goal_tag_id=goal_tag_id,
+                                      arrive_radius_m=(
+                                          self.TAG_ARRIVE_RADIUS_M
+                                          if goal_tag_id is not None
+                                          else None))
         print(f'[{time.time():.3f}] NAV start -> {goal_label} '
-              f'id={goal_id} at {goal_xy}')
+              f'id={goal_id} at {goal_xy}'
+              + ('' if final_yaw is None else f' facing {final_yaw:+.2f}rad'))
 
     def stop_goto(self):
+        if self.seek is not None:
+            print('SEEK stop')
+            self.seek = None
         if self.session_nav is not None:
             print('NAV stop')
-            try:
-                self.http.post(self.cmd_url, json={'action': 'nav_stop'},
-                               timeout=0.5)
-            except Exception:                       # noqa: BLE001
-                pass
+            if (self.grid is not None and self._last_block is not None
+                    and time.time() - self._last_block[0] < 30.0):
+                # stopped by the operator right after being blocked: the
+                # strongest "do not go here" signal there is
+                n = self.grid.mark_trapped(self._last_block[1])
+                print(f'GRID: operator stop after a block -> {n} nodes '
+                      f'marked danger')
+                self._last_block = None
+            # `stop` (not `nav_stop`): it also re-centres the camera on the Pi
+            self._post_pi({'action': 'stop'})
             self.session_nav = None
+            self._recentre_camera(send=False)
 
     def _send_nav(self, cmd, now):
         payload = {'action': 'nav_pulse',
                    'vx': cmd.vx, 'vy': cmd.vy, 'wz': cmd.wz,
                    'seconds': cmd.seconds}
+        self._last_nav_kind = cmd.kind
+        self._calib_on_pulse(cmd, now)
+        self._stuck_on_pulse(cmd, now)
         # timestamp is Unix epoch — same clock as the Pi ROS log stamps,
         # so the two logs can be aligned line-for-line.
         print(f'[{time.time():.3f}] NAV-> {cmd.kind:11s} '
               f'vx={cmd.vx:+.2f} vy={cmd.vy:+.2f} wz={cmd.wz:+.2f} '
-              f'sec={cmd.seconds:.2f}  state={self.session_nav.state.value}')
+              f'sec={cmd.seconds:.2f}  state={self.session_nav.state.value}'
+              f'  {self._nav_pose_text()}')
         try:
             self.http.post(self.cmd_url, json=payload, timeout=0.5)
         except Exception:                           # noqa: BLE001
@@ -434,50 +947,171 @@ class SlamRunner:
                     and self.session_nav.state is State.WAITING_PULSE):
                 self.session_nav.state = State.DRIVING
             return
-        # The robot turns at w_eff while wz only commands w_max — feed the
-        # dead-reckoner the REAL angular rate or its yaw estimate lags ~2x,
-        # heading error never converges and the robot spins forever.
-        rot_scale = (self.nav_config.w_eff / self.nav_config.w_max
-                     if self.nav_config.w_max else 1.0)
-        self.dead_reckoner.record_pulse(cmd.vx, cmd.vy, cmd.wz * rot_scale,
+        # Feed the dead-reckoner the yaw rate the motors REALLY produce, not
+        # the commanded wz. In place that is w_eff (~2.2x the command); as
+        # steering blended into a forward pulse it is only ~0.6x, because the
+        # duty floor swallows most of the left/right difference. Scaling
+        # every pulse by the in-place factor made the reckoner believe a
+        # steered forward pulse had turned ~80 deg, and nav then "corrected"
+        # a turn that never happened.
+        from slam.dead_reckoner import modeled_yaw_rate
+        yaw_rate = modeled_yaw_rate(cmd.vx, cmd.vy, cmd.wz,
+                                    self.nav_config.w_max,
+                                    self.nav_config.w_eff)
+        # Likewise the forward speed: v_eff, not the commanded v_max. Only
+        # forward motion is rescaled — that is the only one measured so far
+        # (one backward sample read 0.17 m/s, strafing none at all).
+        vx = cmd.vx
+        if vx > 0 and self.nav_config.v_max:
+            vx = vx * self.nav_config.v_eff / self.nav_config.v_max
+        self.dead_reckoner.record_pulse(vx, cmd.vy, yaw_rate,
                                         cmd.seconds, now)
 
-    def _drain_pi_events(self):
-        if self.session_nav is None:
-            return
-        try:
-            r = self.http.get(self.event_url, timeout=0.5)
-            if r.status_code != 200:
+    def _nav_pose_text(self):
+        pose, located, stale = getattr(self, '_nav_pose_dbg',
+                                       (None, False, True))
+        if pose is None:
+            return 'pose=none'
+        gx, gy = self.session_nav.goal_xy
+        # 'tag~' = fix from a tag seen face-on: position good, heading shaky
+        src = (('tag' if getattr(self, '_nav_yaw_ok', True) else 'tag~')
+               + str(getattr(self, '_nav_fix_tag', '') or '')
+               if located else ('stale' if stale else 'dr'))
+        return (f'pose=({pose[0]:+.2f},{pose[1]:+.2f},{pose[2]:+.2f}rad) '
+                f'[{src}] goal_dist='
+                f'{((gx - pose[0]) ** 2 + (gy - pose[1]) ** 2) ** 0.5:.2f}m')
+
+    def _feed_nav_events(self, events, now):
+        for event in events:
+            if self.session_nav is None:            # stopped mid-drain
                 return
-            event = r.json().get('event') or ''
-        except Exception:                           # noqa: BLE001
-            return
-        if event:
             before = self.session_nav.state.value
             self.session_nav.on_pi_event(event)
+            self._grid_on_block(event, now)
+            self._calib_on_event(event, now)
+            self._stuck_on_event(event, now)
+            if event.startswith('blocked'):
+                # the Pi cut the pulse short: so must dead reckoning
+                self.dead_reckoner.truncate_pulses(now)
+            if (event == 'pulse_done' and self.grid is not None
+                    and getattr(self, '_last_nav_kind', None) == 'forward'):
+                pose, _located, stale = getattr(
+                    self, '_nav_pose_dbg', (None, False, True))
+                if pose is not None and not stale:
+                    self._grid_note_fix(pose[0], pose[1], now)
             print(f'[{time.time():.3f}] NAV<- event={event:16s} '
                   f'{before} -> {self.session_nav.state.value}')
             if self.session_nav.state.value in ('ARRIVED', 'FAILED'):
-                self._publish_nav_done()
+                self._publish_nav_done(now)
+                return
 
-    def _publish_nav_done(self):
-        reason = (self.session_nav.fail_reason
-                  if self.session_nav.state.value == 'FAILED' else None)
-        ev = {'event': 'nav_done',
-              'state': self.session_nav.state.value,
-              'goal_label': self.session_nav.goal_label,
-              'goal_id': self.session_nav.goal_id,
-              'reason': reason}
-        print(f'[{time.time():.3f}] NAV result: {ev}')
-        with self._nav_done_lock:
-            self._nav_done_event = ev
-        if self.session_nav.state.value == 'FAILED':
-            try:
-                self.http.post(self.cmd_url,
-                               json={'action': 'nav_stop'}, timeout=0.5)
-            except Exception:
-                pass
+    def _get_pi_status(self):
+        try:
+            r = self.http.get(self.event_url, timeout=0.5)
+            return r.json() if r.status_code == 200 else None
+        except Exception:                           # noqa: BLE001
+            return None
+
+    def _publish_nav_done(self, now):
+        nav = self.session_nav
         self.session_nav = None
+        failed = nav.state.value == 'FAILED'
+        if failed:
+            self._post_pi({'action': 'stop'})       # also re-centres the camera
+            self._grid_on_failed(nav)
+        self._recentre_camera(send=not failed)
+        from slam.seek_session import SeekState
+        if self.seek is not None and self.seek.state is SeekState.NAV:
+            # This goto was a leg of a class seek — the seek decides what the
+            # result means (arrived-and-seen vs stale landmark vs retry).
+            print(f'[{time.time():.3f}] SEEK nav leg -> {nav.state.value}'
+                  f'{" (" + str(nav.fail_reason) + ")" if failed else ""}')
+            seek = self.seek
+            self._run_seek_actions(seek, seek.on_nav_done(
+                nav.state.value, now, self._hits(seek.target_class)))
+            return
+        # A map arrival is only "really there" if the object is in sight.
+        # ``seen`` is None for goals with no object class (tags, raw points).
+        seen = (self._seen_recently(nav.goal_label, now)
+                if nav.goal_id is not None else None)
+        ev = {'event': 'nav_done',
+              'state': nav.state.value,
+              'goal_label': nav.goal_label,
+              'goal_id': nav.goal_id,
+              'reason': nav.fail_reason if failed else None,
+              'seen': seen}
+        print(f'[{time.time():.3f}] NAV result: {ev}')
+        self._emit_done(ev, now)
+
+    # ---- class seek: map navigation + visual search as one behaviour ----
+
+    def start_seek(self, target_class):
+        from slam.seek_session import SeekSession
+        self.session_nav = None
+        self._deferred_done = None
+        with self._nav_done_lock:
+            self._nav_done_event = None
+        self.seek = SeekSession(target_class)
+        print(f'[{time.time():.3f}] SEEK start -> {target_class}')
+
+    def _seek_candidates(self, cls):
+        from slam.landmark_selector import by_class
+        robot = self.last_robot or (0.0, 0.0, 0.0)
+        return [{'id': lm.id, 'label': lm.label,
+                 'x': float(lm.position[0]), 'y': float(lm.position[1])}
+                for lm in by_class(self.smap, cls, (robot[0], robot[1]),
+                                   conf_min=self.landmark_conf_min)]
+
+    def _post_pi(self, cmd):
+        try:
+            self.http.post(self.cmd_url, json=cmd, timeout=0.5)
+        except Exception:                           # noqa: BLE001
+            print(f'warning: could not send {cmd} to Pi')
+
+    def _run_seek_actions(self, seek, actions):
+        for act in actions:
+            sight = self._class_sight.get(seek.target_class)
+            sight_txt = ('never' if sight is None else
+                         f"{time.time() - sight['t']:.1f}s ago "
+                         f"h={sight['h_frac']:.2f}"
+                         f"{' clipped' if sight['clipped'] else ''}")
+            print(f'[{time.time():.3f}] SEEK-> {act[0]:10s} '
+                  f'state={seek.state.value}  last_sight={sight_txt}  '
+                  f'trail={seek.trail}')
+            if act[0] == 'find':
+                self._post_pi({'action': 'find', 'target': act[1]})
+            elif act[0] == 'goto':
+                lm = act[1]
+                self.start_goto((lm['x'], lm['y']), lm['id'], lm['label'])
+            elif act[0] == 'nav_cancel':
+                self.session_nav = None     # the next `find` takes the Pi over
+                self._recentre_camera(send=False)   # `find` re-centres it
+            elif act[0] == 'stop':
+                self._post_pi({'action': 'stop'})
+
+    def _tick_seek(self, seek, events, now):
+        for event in events:
+            seek.on_pi_event(event)
+        if not seek.done:
+            cls = seek.target_class
+            self._run_seek_actions(seek, seek.tick(
+                now, self._hits(cls), self._seek_candidates(cls),
+                self._class_sight.get(cls)))
+        if seek.done:
+            arrived = seek.state.value == 'ARRIVED'
+            ev = {'event': 'nav_done',
+                  'state': seek.state.value,
+                  'goal_label': seek.target_class,
+                  'goal_id': seek.goal_id if seek.via == 'map' else None,
+                  'reason': seek.fail_reason,
+                  'seen': True if arrived else None,
+                  'via': seek.via,
+                  'unseen_ids': list(seek.unseen_ids),
+                  'trail': list(seek.trail)}
+            print(f'[{time.time():.3f}] SEEK result: {ev}')
+            self._emit_done(ev, now)
+            if self.seek is seek:
+                self.seek = None
 
 
 def main():
@@ -525,9 +1159,14 @@ def main():
     # navigation
     ap.add_argument('--arrived-radius-m', type=float, default=0.4)
     ap.add_argument('--nav-v-max', type=float, default=0.15)
+    ap.add_argument('--nav-v-eff', type=float, default=0.25,
+                    help='forward speed (m/s) the robot really drives at '
+                         'when commanded --nav-v-max; see motion_calib.csv')
+    ap.add_argument('--nav-max-step-m', type=float, default=0.45,
+                    help='longest stretch driven in one forward pulse')
     ap.add_argument('--nav-w-max', type=float, default=0.5,
                     help='commanded yaw rate for rotate/scan pulses')
-    ap.add_argument('--nav-w-eff', type=float, default=1.12,
+    ap.add_argument('--nav-w-eff', type=float, default=1.5,
                     help='measured real yaw rate at --nav-w-max '
                          '(90deg / rotate_90_sec); sets rotate pulse duration')
     # keep pulses SHORT: a long forward pulse drives a fixed-curvature arc
@@ -540,6 +1179,22 @@ def main():
     ap.add_argument('--scan-max-rotations', type=int, default=12,
                     help='scan steps before FAILED(lost); 12 x 30deg = 360deg')
     ap.add_argument('--landmark-conf-min', type=float, default=0.7)
+    ap.add_argument('--no-grid', action='store_true',
+                    help='drive gotos as straight lines (old behaviour) '
+                         'instead of planning over the learned '
+                         'traversability grid')
+    ap.add_argument('--grid-spacing', type=float, default=0.25,
+                    help='traversability grid node spacing (m)')
+    ap.add_argument('--unknown-weight', type=float, default=3.0,
+                    help='how much costlier unknown ground is than ground '
+                         'the robot has already driven (1 = no preference)')
+    ap.add_argument('--no-pan-aim', action='store_true',
+                    help='keep the camera looking straight ahead during '
+                         'navigation (old behaviour) instead of aiming the '
+                         'pan-tilt at AprilTags')
+    ap.add_argument('--tag-standoff-m', type=float, default=1.0,
+                    help='tag goals (回原点/绕室) stop this far in front of '
+                         'the tag, facing it, so the tag stays in view')
     args = ap.parse_args()
 
     snapshot_url = f'http://{args.pi}:{args.stream_port}/snapshot'
@@ -567,6 +1222,8 @@ def main():
             'nav_v_max': args.nav_v_max,
             'nav_w_max': args.nav_w_max,
             'nav_w_eff': args.nav_w_eff,
+            'nav_v_eff': args.nav_v_eff,
+            'nav_max_step_m': args.nav_max_step_m,
             'max_pulse_sec': args.max_pulse_sec,
             'no_tag_grace_sec': args.no_tag_grace_sec,
             'dr_distance_limit_m': args.dr_distance_limit_m,
@@ -574,6 +1231,11 @@ def main():
             'block_retries': args.block_retries,
             'scan_max_rotations': args.scan_max_rotations,
             'landmark_conf_min': args.landmark_conf_min,
+            'tag_standoff_m': args.tag_standoff_m,
+            'pan_aim': not args.no_pan_aim,
+            'grid': not args.no_grid,
+            'grid_spacing_m': args.grid_spacing,
+            'unknown_weight': args.unknown_weight,
         }
         try:
             slam = SlamRunner(args.pi, args.semantic_port, args.map_port,
@@ -679,8 +1341,10 @@ def main():
             frames += 1
             now = time.time()
             if now - last_log >= 5.0:
+                seen = ','.join(f"{d['cls']}:{d['score']:.2f}" for d in dets)
                 print(f'fps={frames / (now - last_log):.1f}  '
-                      f'last_dets={len(dets)}{slam_info}')
+                      f'last_dets={len(dets)}'
+                      f'{" [" + seen + "]" if seen else ""}{slam_info}')
                 frames = 0
                 last_log = now
     except KeyboardInterrupt:

@@ -17,9 +17,17 @@ _GRID = (60, 60, 60)
 _TAG = (255, 110, 60)
 _PATH = (120, 200, 120)
 _ROBOT = (0, 120, 255)
-_CONFIRMED = (60, 220, 60)
-_TENTATIVE = (40, 200, 230)
+# Object landmarks are magenta: green / yellow / red / blue are taken by the
+# traversability nodes, and the old green dot read as a big "safe" node.
+_CONFIRMED = (230, 70, 230)
+_TENTATIVE = (215, 150, 215)
 _TEXT = (240, 240, 240)
+_ROUTE = (255, 255, 255)
+# traversability grid nodes
+_NODE = {'danger': (40, 40, 235),       # red
+         'near': (0, 215, 255),         # yellow: next to danger
+         'unknown': (235, 140, 50),     # blue
+         'safe': (70, 200, 70)}         # green
 
 
 class MapRenderer:
@@ -40,11 +48,17 @@ class MapRenderer:
                 return
         self.path.append((float(x), float(y)))
 
-    def render(self, tags: list, landmarks: list, robot=None) -> np.ndarray:
+    def render(self, tags: list, landmarks: list, robot=None, grid=None,
+               route=None) -> np.ndarray:
         """Render to a BGR image. ``tags`` and ``landmarks`` are the dicts from
         ``SemanticMap.snapshot()`` / the tag map; ``robot`` is ``(x, y, yaw)``
-        or ``None``."""
+        or ``None``. ``grid`` is ``TraverseGrid.snapshot()`` — nodes drawn
+        red (danger), yellow (next to danger), blue (unknown), green (safe).
+        ``route`` is the planned polyline ``[(x, y), ...]`` if one is active.
+        """
         xs, ys = [], []
+        for n in grid or ():
+            xs.append(n['x']); ys.append(n['y'])
         for t in tags:
             xs.append(t['x']); ys.append(t['y'])
         for lm in landmarks:
@@ -76,6 +90,19 @@ class MapRenderer:
 
         self._draw_grid(img, min_x, max_x, min_y, max_y, to_px)
 
+        # traversability nodes (underneath everything else)
+        for n in grid or ():
+            cv2.circle(img, to_px(n['x'], n['y']), 5,
+                       _NODE.get(n['state'], _NODE['unknown']), -1,
+                       cv2.LINE_AA)
+
+        # planned route
+        if route and len(route) >= 2:
+            pts = np.array([to_px(x, y) for x, y in route], np.int32)
+            cv2.polylines(img, [pts], False, _ROUTE, 1, cv2.LINE_AA)
+            for u, v in pts[1:]:
+                cv2.circle(img, (int(u), int(v)), 4, _ROUTE, 1, cv2.LINE_AA)
+
         # robot path
         if len(self.path) >= 2:
             pts = np.array([to_px(x, y) for x, y in self.path], np.int32)
@@ -95,6 +122,7 @@ class MapRenderer:
             colour = _CONFIRMED if confirmed else _TENTATIVE
             if confirmed:
                 cv2.circle(img, (u, v), 10, colour, -1, cv2.LINE_AA)
+                cv2.circle(img, (u, v), 10, _TEXT, 1, cv2.LINE_AA)
             else:
                 cv2.circle(img, (u, v), 10, colour, 2, cv2.LINE_AA)
             label = f"{lm.get('label', '?')} {lm.get('confidence', 0):.0%}"
@@ -105,7 +133,7 @@ class MapRenderer:
         if robot is not None:
             self._draw_robot(img, to_px, robot)
 
-        self._draw_legend(img, len(tags), len(landmarks))
+        self._draw_legend(img, len(tags), len(landmarks), bool(grid))
         return img
 
     def _draw_grid(self, img, min_x, max_x, min_y, max_y, to_px):
@@ -128,10 +156,19 @@ class MapRenderer:
         right = (u + int(13 * np.cos(yaw - 2.5)), v - int(13 * np.sin(yaw - 2.5)))
         cv2.fillConvexPoly(img, np.array([nose, left, right], np.int32), _ROBOT)
 
-    def _draw_legend(self, img, n_tags, n_landmarks):
+    def _draw_legend(self, img, n_tags, n_landmarks, with_nodes=False):
         cv2.putText(img, f'tags:{n_tags}  objects:{n_landmarks}  (1 grid = 1 m)',
                     (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, _TEXT, 1,
                     cv2.LINE_AA)
+        if not with_nodes:
+            return
+        x = 10
+        for state, label in (('safe', 'safe'), ('unknown', 'unknown'),
+                             ('near', 'near danger'), ('danger', 'danger')):
+            cv2.circle(img, (x + 6, 40), 5, _NODE[state], -1, cv2.LINE_AA)
+            cv2.putText(img, label, (x + 16, 45), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, _TEXT, 1, cv2.LINE_AA)
+            x += 30 + 9 * len(label)
 
 
 class MapImageServer:

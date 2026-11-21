@@ -27,13 +27,28 @@ class NavConfig:
     # this and open-loop mecanum rotation (no encoder) plus noisy single-tag
     # yaw can never land inside the tolerance -> the robot spins forever.
     heading_tol_rad: float = 0.5
-    v_max: float = 0.15
+    v_max: float = 0.15                      # commanded forward speed
+    # speed the robot ACTUALLY drives at when commanded v_max. Like w_eff:
+    # open loop, and the command already sits on the motor duty floor, so
+    # the commanded number is not the real one. Measured from pulses
+    # bracketed by fixes on the same tag: 0.21-0.26 m/s over seven samples,
+    # median 0.25. Assuming 0.15 under-counted every 2.5 s pulse by ~25 cm:
+    # the robot overran its goals and the grid was marked a node behind.
+    v_eff: float = 0.25
+    # Longest stretch to drive in one pulse. Dead reckoning is only trusted
+    # for 0.5 m, so a pulse must end inside that or the pose goes stale and
+    # every step costs a re-localization.
+    max_step_m: float = 0.45
     w_max: float = 0.5                       # commanded yaw rate (rotate/scan)
     # effective yaw rate the robot ACTUALLY turns at when commanded w_max —
     # open-loop, no encoder, so the commanded number is not the real rate.
-    # Used to compute rotate-pulse durations. Default from the kit's
-    # hand-measured rotate_90_sec: 90 deg / 1.4 s ~= 1.12 rad/s.
-    w_eff: float = 1.12
+    # Used to compute rotate-pulse durations. The kit's hand-measured
+    # rotate_90_sec (90 deg / 1.4 s ~= 1.12 rad/s) proved too low in the
+    # field: four turns checked against tag fixes all overshot by 40-45%
+    # (e.g. a 1.11 s pulse meant for 71 deg turned 103 deg), i.e. ~1.5 rad/s.
+    # It varies with battery voltage and floor, so treat it as approximate —
+    # a tag fix after the turn is what actually settles the heading.
+    w_eff: float = 1.5
     max_pulse_sec: float = 2.5
     min_pulse_sec: float = 0.2
     # forward pulses blend in proportional steering so the robot curves onto
@@ -44,8 +59,12 @@ class NavConfig:
     # motion-blur-free frames to re-localize before the next pulse.
     nav_dwell_sec: float = 2.0
     strafe_speed: float = 0.15
-    strafe_seconds: float = 0.6
-    avoid_forward_seconds: float = 0.8
+    # Side-step per block. The Nth consecutive block strafes N x this long
+    # (capped), i.e. ~15 cm, then ~30 cm: a fixed 9 cm step three times in a
+    # row never got around a real obstacle in the field.
+    strafe_seconds: float = 1.0
+    strafe_max_seconds: float = 3.0
+    avoid_forward_seconds: float = 1.5
     blocked_backup_sec: float = 1.0          # reverse for clearance per block
     block_retries: int = 3
     # after block_retries side-steps fail, don't give up: back up and re-plan.
@@ -63,6 +82,28 @@ class NavConfig:
     # arrived_radius because the ultrasonic trips on the object SURFACE while
     # the goal landmark is its CENTRE.
     blocked_arrival_dist_m: float = 1.0
+    # goals with a final heading (tag goals: end up LOOKING at the tag):
+    # once inside the arrival radius, turn in place until within this
+    # tolerance. Open-loop turns overshoot, so allow a few corrective tries
+    # and then arrive regardless rather than hunt forever.
+    final_heading_tol_rad: float = 0.3
+    final_face_max: int = 3
+    # The final heading may only be CONFIRMED by a real tag fix. Dead
+    # reckoning assumes every turn was perfect, so it always "confirms" a
+    # turn that in reality overshot by 30 deg. Wait this long for a fix
+    # before settling for the dead-reckoned heading.
+    final_fix_wait_sec: float = 12.0
+    # A tag goal is faced by where the tag sits in the picture, not by the
+    # solved heading: "centred" means within this of straight ahead.
+    face_bearing_tol_rad: float = 0.2
+    # Route following (traversability grid). An intermediate waypoint counts
+    # as reached within this radius; only the goal needs arrived_radius_m.
+    waypoint_radius_m: float = 0.3
+    # With a planner behind it, a block is not answered by blind side-steps:
+    # the session backs off and asks for a new route (``needs_replan``),
+    # having told the caller where the obstacle is.
+    replan_on_block: bool = False
+    max_blocks: int = 8                      # blocks per goto before FAILED
 
 
 @dataclass
@@ -93,7 +134,46 @@ class NavSession:
     _drive_resume_t: float | None = None     # dwell-until time after a pulse
     # obstacle-vs-target discrimination for a blocked:front event
     _target_ahead: bool = False              # camera sees the goal class close
+    # heading to end at (map frame, rad), or None = any heading will do
+    final_yaw: float | None = None
+    _facing: bool = False                    # position reached, now turning
+    _face_count: int = 0
+    _final_wait_t: float | None = None       # waiting for a fix to confirm
+    # the AprilTag this goto is going to look at, if it is a tag goal
+    goal_tag_id: int | None = None
+    # arrival radius for this goto; None = config.arrived_radius_m
+    arrive_radius_m: float | None = None
+    # route: intermediate points to pass through on the way to goal_xy
+    waypoints: list = field(default_factory=list)
+    route_ready: bool = False                # a route has been planned
+    needs_replan: bool = False               # blocked: caller must re-plan
+    blocks_total: int = 0
     _last_goal_dist: float = float('inf')    # map distance at the last tick
+
+    def set_route(self, waypoints):
+        """Intermediate points to drive through, in order, before the goal
+        (the goal itself is not included)."""
+        self.waypoints = [(float(x), float(y)) for x, y in waypoints]
+        self.route_ready = True
+        self.needs_replan = False
+
+    def on_stuck(self):
+        """A forward pulse ran its course and the robot did not move — held
+        by something the front sensor cannot see. Treated like a block: back
+        off, and have the caller plan a way round."""
+        self.blocks_total += 1
+        if self.blocks_total > self.config.max_blocks:
+            self.state = State.FAILED
+            self.fail_reason = 'blocked'
+            return
+        self.queued.clear()
+        self.queued.append(NavCommand(-self.config.v_max, 0.0, 0.0,
+                                      self.config.blocked_backup_sec,
+                                      'backward'))
+        self.needs_replan = True
+        self._drive_resume_t = None
+        if self.state is not State.WAITING_PULSE:
+            self.state = State.DRIVING
 
     def on_tag_fix(self, t: float):
         """Record that a tag-fix arrived at time ``t``.
@@ -124,11 +204,30 @@ class NavSession:
             # A front block on the goal itself is an arrival, not an obstacle:
             # treat it as ARRIVED when the camera sees the goal class close
             # ahead, or the map puts us near the goal landmark.
-            if side == 'front' and (
+            # ...but only for a goal that IS an object. A goal with a final
+            # heading is a spot on the floor to stand on and look from (a tag
+            # standoff): bumping into something near it is not arriving, and
+            # ending there skipped the turn to face the tag.
+            if (side == 'front' and self.final_yaw is None and (
                     self._target_ahead
                     or self._last_goal_dist
-                    < self.config.blocked_arrival_dist_m):
+                    < self.config.blocked_arrival_dist_m)):
                 self.state = State.ARRIVED
+                return
+            self.blocks_total += 1
+            if self.config.replan_on_block:
+                if self.blocks_total > self.config.max_blocks:
+                    self.state = State.FAILED
+                    self.fail_reason = 'blocked'
+                    return
+                # back off for clearance, then drive the route the caller
+                # plans around the obstacle
+                self.queued.clear()
+                self.queued.append(NavCommand(
+                    -self.config.v_max, 0.0, 0.0,
+                    self.config.blocked_backup_sec, 'backward'))
+                self.needs_replan = True
+                self.state = State.DRIVING
                 return
             self._handle_blocked(side)
 
@@ -156,23 +255,38 @@ class NavSession:
         elif side == 'right':
             vy = +self.config.strafe_speed
         else:                                       # 'front' or unknown
-            vy = +self.config.strafe_speed         # default: try left
+            # No side information: try left first, and switch sides after
+            # each failed recovery cycle instead of repeating the same one.
+            sign = 1.0 if self.recovery_count % 2 == 0 else -1.0
+            vy = sign * self.config.strafe_speed
+        # Escalate: each consecutive block steps further sideways.
+        strafe_sec = min(self.config.strafe_seconds * self.block_count,
+                         self.config.strafe_max_seconds)
+        # A new block supersedes whatever was left of the previous manoeuvre.
+        self.queued.clear()
         # Back up first for clearance, then strafe away, then resume forward.
         # The reverse step matters because the narrow front ultrasonic beam
         # can lose a still-present obstacle after only a small strafe.
         self.queued.append(NavCommand(-self.config.v_max, 0.0, 0.0,
                                       self.config.blocked_backup_sec,
                                       'backward'))
-        self.queued.append(NavCommand(0.0, vy, 0.0,
-                                      self.config.strafe_seconds, 'strafe'))
+        self.queued.append(NavCommand(0.0, vy, 0.0, strafe_sec, 'strafe'))
         self.queued.append(NavCommand(self.config.v_max, 0.0, 0.0,
                                       self.config.avoid_forward_seconds,
                                       'forward'))
         self.state = State.DRIVING
 
     def tick(self, robot_pose, now: float, pose_stale: bool = False,
-             target_ahead: bool = False):
+             target_ahead: bool = False, pose_fresh: bool = True,
+             goal_bearing: float | None = None):
         """Produce the next motion pulse, or None if nothing to send.
+
+        ``goal_bearing`` — for a tag goal, the direction of that tag from
+        the robot's heading as seen in THIS frame (rad, + = to the left), or
+        None when it is not in view.
+
+        ``pose_fresh`` — ``robot_pose`` is a tag fix from this very frame
+        rather than a dead-reckoned extrapolation.
 
         ``target_ahead`` — the camera currently sees the goal's object class
         large and centred (i.e. the thing right in front is the target).
@@ -209,10 +323,64 @@ class NavSession:
             self._scan_resume_t = None
 
         x, y, yaw = robot_pose
-        dx, dy = self.goal_xy[0] - x, self.goal_xy[1] - y
+        radius = self.arrive_radius_m or self.config.arrived_radius_m
+        goal_dist = math.hypot(self.goal_xy[0] - x, self.goal_xy[1] - y)
+        self._last_goal_dist = goal_dist
+        # tick off waypoints already reached; within reach of the goal the
+        # rest of the route no longer matters
+        while self.waypoints and (
+                goal_dist < radius
+                or math.hypot(self.waypoints[0][0] - x,
+                              self.waypoints[0][1] - y)
+                < self.config.waypoint_radius_m):
+            self.waypoints.pop(0)
+        target = self.waypoints[0] if self.waypoints else self.goal_xy
+        dx, dy = target[0] - x, target[1] - y
         dist = math.hypot(dx, dy)
-        self._last_goal_dist = dist
-        if dist < self.config.arrived_radius_m:
+        if self._facing or goal_dist < radius:
+            settling = (self._drive_resume_t is not None
+                        and now < self._drive_resume_t)
+            if self._facing and settling:
+                return None             # let the last facing turn settle
+            if self.final_yaw is not None or goal_bearing is not None:
+                if goal_bearing is not None:
+                    # The goal tag is in view: turn until it is centred. This
+                    # needs no pose at all, so it cannot be thrown by fixes
+                    # that disagree about the heading — and it is exactly
+                    # what "arrived, looking at the tag" means.
+                    err = goal_bearing
+                    tol = self.config.face_bearing_tol_rad
+                    pose_fresh = True
+                else:
+                    err = _wrap(self.final_yaw - yaw)
+                    tol = self.config.final_heading_tol_rad
+                turn = (abs(err) > tol
+                        and self._face_count < self.config.final_face_max)
+                if not turn and not pose_fresh:
+                    # About to call the heading good on dead reckoning alone
+                    # — hold position and wait for a tag fix to confirm it.
+                    self._facing = True
+                    if self._final_wait_t is None:
+                        self._final_wait_t = now
+                    if (now - self._final_wait_t
+                            < self.config.final_fix_wait_sec):
+                        return None
+                if turn:
+                    if settling:
+                        return None
+                    self._final_wait_t = None
+                    # Position reached; from here on only turn — never drive
+                    # off again because the turn nudged us out of the radius.
+                    self._facing = True
+                    self._face_count += 1
+                    wz = self.config.w_max * (1.0 if err > 0 else -1.0)
+                    sec = _clamp(abs(err) / self.config.w_eff,
+                                 self.config.min_pulse_sec,
+                                 self.config.max_pulse_sec)
+                    self._drive_resume_t = (now + sec
+                                            + self.config.nav_dwell_sec)
+                    self.state = State.WAITING_PULSE
+                    return NavCommand(0.0, 0.0, wz, sec, 'rotate')
             self.state = State.ARRIVED
             return NavCommand(0.0, 0.0, 0.0, 0.0, 'stop')
 
@@ -244,7 +412,7 @@ class NavSession:
         # roughly aimed -> drive forward, blending in proportional steering so
         # the heading self-corrects along the way (curve onto the goal line,
         # no drift-then-snap zigzag).
-        sec = _clamp(dist / self.config.v_max,
+        sec = _clamp(min(dist, self.config.max_step_m) / self.config.v_eff,
                      self.config.min_pulse_sec, self.config.max_pulse_sec)
         wz = _clamp(self.config.steer_gain * heading_err,
                     -self.config.forward_steer_max,

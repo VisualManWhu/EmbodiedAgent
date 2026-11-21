@@ -137,6 +137,12 @@ class AgentNode(Node):
         self.ir_range = float('inf')
         self.obs_left = False
         self.obs_right = False
+        # Pan-tilt setpoint (rad) held while IDLE / between NAV pulses. Set by
+        # the `pantilt` command so the laptop can aim the camera at AprilTags
+        # without turning the chassis; SEARCH and `stop` re-centre it, because
+        # the visual approach assumes the camera looks straight ahead.
+        self.pt_yaw = 0.0
+        self.pt_pitch = 0.0
         # Stop-and-scan phase tracking.
         self.scan_phase = 'rotate'
         self.scan_phase_start = time.time()
@@ -281,6 +287,14 @@ class AgentNode(Node):
         action = cmd.get('action')
         if action == 'stop':
             self.mode = 'IDLE'
+            self.pt_yaw = self.pt_pitch = 0.0
+        elif action == 'pantilt':
+            # Aim the camera only; the drive mode is left untouched.
+            # pantilt_node clamps to the servo's mechanical range.
+            self.pt_yaw = max(-math.pi, min(math.pi,
+                                            float(cmd.get('yaw', 0.0))))
+            self.pt_pitch = max(-math.pi / 2, min(math.pi / 2,
+                                                  float(cmd.get('pitch', 0.0))))
         elif action == 'move':
             self.mode = 'MANUAL'
             self.manual_twist = self._dir_to_twist(cmd.get('dir'))
@@ -293,6 +307,7 @@ class AgentNode(Node):
             if target:
                 self.target_class = target
                 self.reset_search(now)
+                self.pt_yaw = self.pt_pitch = 0.0
                 self.mode = 'SEARCH'
         elif action == 'nav_pulse':
             self.mode = 'NAV'
@@ -560,7 +575,7 @@ class AgentNode(Node):
 
         if self.mode == 'IDLE':
             self.publish_full_cmd(0.0, 0.0, 0.0)
-            self.publish_pantilt(0.0, 0.0)
+            self.publish_pantilt(self.pt_yaw, self.pt_pitch)
         elif self.mode == 'MANUAL':
             self.tick_manual(now)
         elif self.mode == 'SEARCH':

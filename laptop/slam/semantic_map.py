@@ -37,6 +37,7 @@ class FusionConfig:
     tentative_stale_sec: float = 25.0    # prune unconfirmed landmarks idle this long
     miss_demote: int = 4                 # misses -> CONFIRMED demoted to TENTATIVE
     miss_prune: int = 8                  # misses -> landmark removed entirely
+    max_range_m: float = 8.0             # ignore ground projections past this
 
 
 @dataclass
@@ -111,6 +112,12 @@ class SemanticMap:
         origin, ray = projection.pixel_ray_in_world(T_map_cam, u, v, K)
         ground = projection.ground_plane_intersect(origin, ray)
         if ground is None:
+            return None
+        # A ray that barely dips below the horizon meets the floor absurdly
+        # far away, and a pixel of noise moves that point by metres. Beyond
+        # max_range_m the ground projection carries no usable position.
+        if (np.hypot(ground[0] - origin[0], ground[1] - origin[1])
+                > self.cfg.max_range_m):
             return None
 
         obs = Observation(cam_origin=origin, ray_dir=ray, ground_xy=ground,
